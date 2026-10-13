@@ -1,0 +1,8 @@
+Manifest.toml
+Manifest-v*.toml
+.DS_Store
+.ipynb_checkpoints/
+*.ckpt
+
+# Local working notes; not part of the package.
+CLAUDE.md
