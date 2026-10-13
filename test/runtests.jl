@@ -4731,7 +4731,7 @@ end
     end
 end
 
-@testset "Wigner Chebyshev GPU table" begin
+@testset "Wigner Chebyshev table against ringD and upload" begin
     cp = ConvolutionParams(
         nside_output=2,
         lstart=1,
@@ -4747,56 +4747,28 @@ end
         beta_max=0.8,
         precision=Float64,
     )
+    table = build_wigner_chebyshev_table_cpu(cp, plan)
 
     if CUDA.functional()
-        table = CUDA.@sync build_wigner_chebyshev_table_gpu(cp, plan)
-        cpu_table = build_wigner_chebyshev_table_cpu(cp, plan)
-        @test table.pair_M == cpu_table.pair_M
-        @test table.pair_n == cpu_table.pair_n
-        @test table.first_l == cpu_table.first_l
-        @test table.coefficients ≈
-            cpu_table.coefficients atol=5e-12 rtol=5e-12
-        expected_pairs = Tuple{Int,Int}[
-            (M, n)
-            for n in -plan.nmax:plan.nmax
-            for M in max(-2, n - plan.kappa):min(2, n + plan.kappa)
-        ]
-        actual_pairs = collect(zip(Int.(table.pair_M), Int.(table.pair_n)))
-        @test actual_pairs == expected_pairs
-        @test table.lstart == cp.lstart
-        @test table.lstop == cp.lstop
-        @test table.kappa == cp.κ
-        @test table.nmax == plan.nmax
-        @test table.beta_max == plan.beta_max
-        @test size(table.coefficients) == (
-            plan.beta_order,
-            length(expected_pairs),
-            cp.lstop - cp.lstart + 1,
-        )
-        @test eltype(table.coefficients) === Float64
-
+        # Every coefficient of the CPU table, evaluated at one beta, against
+        # the GPU ringD recursion: two independent recurrence codes.
         beta = 0.37
         chebyshev = zeros(Float64, plan.beta_order)
         EBCoDeCMB._chebyshev_values!(chebyshev, plan, beta)
-        ringd_device = CUDA.@sync ringd_blocks_recursion_gpu(
-            cp,
-            beta;
-            precision=Float64,
-        )
-        ringd = Array(ringd_device)
+        context = ringd_context(cp; precision=Float64)
+        ringd = Array(CUDA.@sync ringd_blocks_recursion_gpu!(context, cp, beta))
+        free_ringd_context!(context)
         Mmax_global = calc_Mmax(cp, cp.lstop)
         for pair_index in eachindex(table.pair_M)
             M = Int(table.pair_M[pair_index])
             n = Int(table.pair_n[pair_index])
-            expected_first_l = max(cp.lstart, abs(M), abs(n))
-            @test table.first_l[pair_index] == expected_first_l
             for l in cp.lstart:cp.lstop
                 l_index = l - cp.lstart + 1
                 approximation = sum(
                     @view(table.coefficients[:, pair_index, l_index]) .*
                     chebyshev,
                 )
-                if l < expected_first_l
+                if l < table.first_l[pair_index]
                     @test approximation == 0.0
                 else
                     Mmax_l = min(Mmax_global, l)
@@ -4832,48 +4804,8 @@ end
             beta_max=0.8,
             precision=Float32,
         )
-        table32 = CUDA.@sync build_wigner_chebyshev_table_gpu(cp, plan32)
-        @test eltype(table32.coefficients) === Float32
+        table32 = build_wigner_chebyshev_table_cpu(cp, plan32)
         @test eltype(upload_wigner_table_gpu(table32).coefficients) === Float32
-
-        bad_kappa = ScanMomentPlan(
-            kappa=2,
-            nmax=1,
-            beta_order=4,
-            beta_max=0.8,
-        )
-        @test_throws ArgumentError build_wigner_chebyshev_table_gpu(
-            cp,
-            bad_kappa,
-        )
-        bad_nmax = ScanMomentPlan(
-            kappa=1,
-            nmax=0,
-            beta_order=4,
-            beta_max=0.8,
-        )
-        @test_throws ArgumentError build_wigner_chebyshev_table_gpu(
-            cp,
-            bad_nmax,
-        )
-        hwp_cp = ConvolutionParams(
-            nside_output=2,
-            lstop=4,
-            lmax=4,
-            bnmax=1,
-            κ=1,
-            HWP=true,
-            HWP_rpm=60,
-        )
-        @test_throws ArgumentError build_wigner_chebyshev_table_gpu(
-            hwp_cp,
-            plan,
-        )
-    else
-        @test_throws ArgumentError build_wigner_chebyshev_table_gpu(
-            cp,
-            plan,
-        )
     end
 end
 

@@ -48,7 +48,7 @@ export ringd_blocks_recursion_gpu, ringd_blocks_recursion_gpu!
 export RingDContext, ringd_context, free_ringd_context!
 export WignerChebyshevTable
 export build_wigner_chebyshev_table_cpu
-export build_wigner_chebyshev_table_gpu, upload_wigner_table_gpu
+export upload_wigner_table_gpu
 export build_effective_kernel_gpu, apply_beams_gemm_gpu
 export build_effective_beam_gpu
 export build_sky_ring_gpu

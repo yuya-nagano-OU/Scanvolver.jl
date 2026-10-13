@@ -45,8 +45,6 @@ JULIA_NUM_THREADS=8 julia --project=notebook
   spin conversion, and negative-mode reconstruction. It runs on the CPU.
 - `prepare_blm_validation.ipynb` demonstrates beam layout, conjugation, and
   spin symmetry. It runs on the CPU.
-- `wigner_chebyshev_table_validation.ipynb` compares CPU and GPU table
-  construction with direct GPU ringD evaluation and requires CUDA.
 
 Notebook outputs are cleared in the repository so that local paths, hardware
 details, and stale numerical results are not published as source artifacts.

@@ -233,9 +233,9 @@ end
     build_wigner_chebyshev_table_cpu(cp, plan) -> WignerChebyshevTable
 
 Build the scan-independent Chebyshev coefficients of all required
-`d^l_{Mn}(beta)` values on the CPU. This reference path uses an independent
-CPU recurrence, returns the same packed table layout as the GPU builder, and
-does not require a functional CUDA device.
+`d^l_{Mn}(beta)` values on the CPU, with a recurrence independent of the GPU
+ringD code. Send the table to a device with `upload_wigner_table_gpu`. Does not
+require a functional CUDA device.
 """
 function build_wigner_chebyshev_table_cpu(
     cp,
