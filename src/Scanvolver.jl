@@ -1,8 +1,10 @@
 module Scanvolver
 
 using CUDA
+using Dates: now, UTC
+using HDF5: HDF5, h5open, attributes, create_group, create_dataset
 using Healpix: Resolution, pix2angRing, ang2pixRing, getringinfo,
-    numOfRings
+    numOfRings, max_pixrad
 using LinearAlgebra: cond, lu
 using SpecialFunctions: loggamma
 using StaticArrays: @SMatrix
@@ -30,12 +32,15 @@ include("geometry/scan_buffer.jl")
 include("convolution/memory_model.jl")
 include("convolution/contraction.jl")
 include("mapmaking/mapmaking.jl")
+include("pipeline/hdf5_file.jl")
+include("pipeline/convolve_to_hdf5.jl")
+include("pipeline/detector_groups.jl")
 
 export ConvolutionParams, Angles, show_cp
 export PreparedAlm, prepare_alm, alm_slice
 export GPUAlm, upload_alm_gpu
-export PreparedBlm, prepare_blm, blm_slice
-export ScanMomentPlan, chebyshev_nodes
+export PreparedBlm, prepare_blm, blm_slice, beam_batches
+export ScanMomentPlan, chebyshev_nodes, automatic_beta_max, automatic_scan_plan
 export scan_moments_cpu, scan_moments_gpu
 export scan_moments_direct_gpu, scan_moments_gemm_gpu
 export scan_moments_gemm_memory_bytes
@@ -54,7 +59,10 @@ export make_ring_angles
 export RingScanBuffer, build_ring_scan_buffer
 export ring_scan_buffer_bytes, ring_hit_count
 export accumulate_convolution_tile_gemm_gpu!
-export ring_memory_bytes, max_indexable_l_tile
+export ring_memory_bytes, max_indexable_l_tile, streamed_tile_bytes
 export RingConvolution, ring_stokes
+export convolve_to_hdf5, read_ring_hdf5
+export convolve_detector_groups_to_hdf5, detector_group_batches
+export grouped_ring_stokes, reduce_detector_accumulators, read_group_ring_hdf5
 
 end

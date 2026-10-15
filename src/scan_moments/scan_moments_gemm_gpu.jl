@@ -419,13 +419,6 @@ function scan_moments_gemm_gpu(
     end
 end
 
-function _scan_moment_available_memory()
-    return min(
-        Int128(CUDA.total_memory()),
-        Int128(CUDA.free_memory()) + Int128(CUDA.cached_memory()),
-    )
-end
-
 """
     scan_moments_gpu(
         plan, angles;
@@ -481,7 +474,7 @@ function scan_moments_gpu(
     end
 
     required_bytes = scan_moments_gemm_memory_bytes(plan, angles)
-    available_bytes = _scan_moment_available_memory()
+    available_bytes = _available_device_bytes()
     budget_bytes = floor(
         Int128,
         Float64(memory_fraction) * Float64(available_bytes),

@@ -1,20 +1,6 @@
-module DetectorGroupedHDF5
-
-using CUDA
-using Scanvolver
-using HDF5
-using HDF5: attributes
-using LinearAlgebra
-
-# The ring queue, tiling, HDF5 bookkeeping and reader are BeamBatchedHDF5's.
-# This module adds a map layout: detector groups combined before the solve.
-include(joinpath(@__DIR__, "..", "beam_batched_hdf5", "beam_batched_pipeline.jl"))
-using .BeamBatchedHDF5
-import .BeamBatchedHDF5: MapLayout, output_count, output_batch_size, output_indices,
-    output_name, batch_stokes, extra_record, write_layout!
-
-export convolve_detector_groups_to_hdf5, detector_group_batches
-export grouped_ring_stokes, reduce_detector_accumulators, read_group_ring_hdf5
+# Detector groups: consecutive detector beams combined at the sufficient-
+# statistic level and solved once per group. A map layout of the same machinery
+# as convolve_to_hdf5 (DetectorGroupMaps).
 
 const DEFAULT_DETECTOR_LABELS = ("Qp", "Qm", "Up", "Um")
 const DEFAULT_DETECTOR_OFFSETS = (0.0, pi / 2, pi / 4, 3pi / 4)
@@ -39,7 +25,7 @@ function detector_group_batches(blm::PreparedBlm, detectors_per_group::Integer,
     blm.numofbeam % detectors_per_group == 0 || throw(ArgumentError(
         "$(blm.numofbeam) beams cannot be divided into groups of $detectors_per_group",
     ))
-    source_batches = BeamBatchedHDF5.beam_batches(
+    source_batches = beam_batches(
         blm, Int(detectors_per_group) * Int(group_batch_size),
     )
     return [(
@@ -162,7 +148,7 @@ function extra_record(layout::DetectorGroupMaps, cp, T, active_count, batches)
     grouped_bytes = Int128(sizeof(Complex{T})) * cp.numofsky * output_count(layout, cp) *
                     active_count * 2
     return (group_reductions=length(batches),
-            input_accumulator_bytes=Int64(BeamBatchedHDF5.accumulator_bytes(cp, T, active_count)),
+            input_accumulator_bytes=Int64(accumulator_bytes(cp, T, active_count)),
             grouped_accumulator_bytes=Int64(grouped_bytes))
 end
 
@@ -182,8 +168,8 @@ function write_layout!(file, layout::DetectorGroupMaps, cp, devices)
     file["detector_labels"] = collect(string.(layout.labels))
     file["detector_offsets_rad"] = collect(Float64.(layout.offsets))
     file["detector_weights"] = collect(Float64.(layout.weights))
-    BeamBatchedHDF5.write_metadata_group!(file, "input_beam_metadata", layout.input_beam_metadata)
-    BeamBatchedHDF5.write_metadata_group!(file, "group_metadata", layout.group_metadata)
+    write_metadata_group!(file, "input_beam_metadata", layout.input_beam_metadata)
+    write_metadata_group!(file, "group_metadata", layout.group_metadata)
     return ("group_reductions", "input_accumulator_bytes", "grouped_accumulator_bytes")
 end
 
@@ -193,7 +179,7 @@ end
 Convolve every input detector beam, combine consecutive detector groups at the
 sufficient-statistic level, then perform one Scanvolver mapmaking solve per
 group. The ring queue, tiling and HDF5 bookkeeping are those of
-`BeamBatchedHDF5.convolve_to_hdf5`; only the per-batch solve and the file
+`convolve_to_hdf5`; only the per-batch solve and the file
 metadata differ. The default group order is `Qp,Qm,Up,Um` with offsets
 `0, pi/2, pi/4, 3pi/4`.
 """
@@ -225,7 +211,7 @@ function convolve_detector_groups_to_hdf5(
         "cp.numofbeam must be divisible by the detector count",
     ))
     group_count = cp.numofbeam ÷ detector_count
-    ring_list, device_list, path = BeamBatchedHDF5.check_run_inputs(
+    ring_list, device_list, path = check_run_inputs(
         cp, buffer, alm, blm; map_precision, rings, devices, output_path, l_tile,
         max_l_tile, memory_fraction, rcond, unseen, reclaim_interval)
     group_batch_size > 0 || throw(ArgumentError("batch and tile sizes must be positive"))
@@ -248,7 +234,7 @@ function convolve_detector_groups_to_hdf5(
                                detector_weights, input_beam_ids, group_ids,
                                input_beam_metadata, group_metadata)
     batches = detector_group_batches(blm, detector_count, group_batch_size)
-    return BeamBatchedHDF5.run_rings(
+    return run_rings(
         layout, cp, buffer, alm, blm, batches, path, ring_list, device_list;
         beta_order, l_tile, max_l_tile, memory_fraction, moment_method, map_precision,
         rcond, unseen, reclaim_interval, sky_ids, metadata, batch_callback,
@@ -257,6 +243,4 @@ end
 
 """Read a completed ring as `(sky, detector_group, I/Q/U, ring_pixel)`."""
 read_group_ring_hdf5(path, ring::Integer; skies=nothing, groups=nothing) =
-    BeamBatchedHDF5.read_ring_maps(path, ring, skies, groups, "group")
-
-end # module
+    read_ring_maps(path, ring, skies, groups, "group")

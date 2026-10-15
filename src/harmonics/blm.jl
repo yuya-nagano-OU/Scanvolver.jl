@@ -190,3 +190,18 @@ function _prepare_blm(
         cp.numofbeam,
     )
 end
+
+"""Split already-prepared, conjugated beams without conjugating them again."""
+function beam_batches(blm::PreparedBlm{T}, batch_size::Integer) where {T}
+    batch_size > 0 || throw(ArgumentError("beam_batch_size must be positive"))
+    return [
+        (indices=first:min(first + Int(batch_size) - 1, blm.numofbeam),
+         blm=PreparedBlm{T}(
+             [ntuple(spin -> block[spin][:, first:min(first + Int(batch_size) - 1, blm.numofbeam)], 3)
+              for block in blm.slices],
+             blm.lstart, blm.lstop, blm.lmax, blm.bnmax,
+             min(Int(batch_size), blm.numofbeam - first + 1),
+         ))
+        for first in 1:Int(batch_size):blm.numofbeam
+    ]
+end

@@ -99,3 +99,26 @@ function _chebyshev_transform(plan::ScanMomentPlan{T}) where {T}
     end
     return transform
 end
+
+"""
+    automatic_beta_max(nside; precision=Float32)
+
+HEALPix's global centre-to-corner radius, rounded upward with a small
+allowance for Float64 rotation arithmetic and conversion to compute precision.
+This is the output-map resolution, not the beam-generation resolution.
+The allowance is 64 Float64 epsilons (radians) plus 8 relative compute epsilons.
+Actual local beta is still checked on every ring before constructing moments.
+"""
+function automatic_beta_max(nside::Integer; precision::Type=Float32)
+    precision in (Float32, Float64) || throw(ArgumentError("precision must be Float32 or Float64"))
+    radius = Float64(max_pixrad(Resolution(Int(nside))))
+    allowance = 64eps(Float64) + 8Float64(eps(precision)) * radius
+    return nextfloat(precision(radius + allowance))
+end
+
+function automatic_scan_plan(cp; beta_order::Integer=8, precision::Type=Float32)
+    return ScanMomentPlan(
+        kappa=cp.κ, nmax=calc_nmax(cp, cp.lstop), beta_order=beta_order,
+        beta_max=automatic_beta_max(cp.nside_output; precision), precision=precision,
+    )
+end

@@ -3837,3 +3837,5 @@ end
         ψ=ψ,
     )
 end
+
+include("test_hdf5_pipelines.jl")

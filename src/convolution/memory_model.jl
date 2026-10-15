@@ -135,3 +135,45 @@ function max_indexable_l_tile(
     per_tile == 0 && return cp.lstop - cp.lstart + 1
     return Int(min(Int128(cp.lstop - cp.lstart + 1), limit ÷ per_tile))
 end
+
+"""Free device memory, counting memory CUDA.jl has cached for reuse."""
+_available_device_bytes() = min(Int128(CUDA.total_memory()),
+                                Int128(CUDA.free_memory()) + Int128(CUDA.cached_memory()))
+
+"""
+    streamed_tile_bytes(cp_batch, ring_pixels, active_pixels, l_tile; precision, complete_ring)
+
+Peak explicit device buffers for one tile, including simultaneous K + full U
++ gathered U during beam application. K and U both remain resident across beam
+batches. Scan moments, ringD, accumulators,
+the uploaded alm/table and cuFFT's plan-dependent workspace are excluded.
+"""
+function streamed_tile_bytes(cp, ring_pixels, active_pixels, tile;
+                             precision=Float32, complete_ring=false)
+    sizes = ring_memory_bytes(cp, ring_pixels, active_pixels, tile;
+                              precision, complete_ring)
+    bytes = Int128(sizeof(Complex{precision}))
+    modes = Int128(2calc_Mmax(cp, cp.lstop) + 1)
+    delta = Int128(2cp.κ + 1)
+    beams = Int128(cp.numofbeam)
+    packed = Int128(2calc_nmax(cp, cp.lstop) + 1) * 3 * beams * tile * bytes
+    matrices = 3 * beams * delta * modes * tile * bytes
+    gemm = 3 * beams * Int128(active_pixels) * modes * tile * bytes
+    beam_peak = max(packed + matrices, matrices + gemm + sizes.effective_beam)
+    return sizes.effective_kernel + sizes.sky_ring + sizes.active_sky_ring + beam_peak
+end
+
+function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction)
+    unit = streamed_tile_bytes(cp_batch, geometry.pixel_count, length(active), 1;
+                               precision=T, complete_ring=active.complete)
+    budget = floor(Int128, fraction * Float64(_available_device_bytes()))
+    index_limit = max_indexable_l_tile(cp_batch, length(active))
+    ceiling = min(cp_batch.lstop - cp_batch.lstart + 1, index_limit)
+    width = l_tile === :auto ?
+        Int(min(Int128(min(ceiling, max_l_tile)), budget ÷ unit)) :
+        min(Int(l_tile), cp_batch.lstop - cp_batch.lstart + 1)
+    width >= 1 && width <= ceiling && unit * width <= budget ||
+        throw(ArgumentError("ring $(geometry.ring): l tile does not fit the device/index budget " *
+                            "(one-l bytes=$unit, budget=$budget, index_limit=$index_limit)"))
+    return width, unit * width
+end
