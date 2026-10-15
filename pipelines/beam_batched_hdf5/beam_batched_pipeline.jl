@@ -52,8 +52,8 @@ end
     streamed_tile_bytes(cp_batch, ring_pixels, active_pixels, l_tile; precision, complete_ring)
 
 Peak explicit device buffers for one tile, including simultaneous K + full U
-+ gathered U during beam application. Unlike the existing ring driver, K and U
-both remain resident across beam batches. Scan moments, ringD, accumulators,
++ gathered U during beam application. K and U both remain resident across beam
+batches. Scan moments, ringD, accumulators,
 the uploaded alm/table and cuFFT's plan-dependent workspace are excluded.
 """
 function streamed_tile_bytes(cp, ring_pixels, active_pixels, tile;
@@ -129,6 +129,71 @@ function free_context(context)
     return nothing
 end
 
+"""
+    MapLayout
+
+What a run writes for each batch of beams. `BeamMaps` gives one `(I, Q, U)`
+map per beam; `DetectorGroupedHDF5` adds one map per detector group. The ring
+queue, the tiling, the HDF5 bookkeeping and the reader are shared; a layout
+only says how a batch is solved and what the file records about it.
+"""
+abstract type MapLayout end
+
+"""One `(I, Q, U)` map per input beam."""
+struct BeamMaps <: MapLayout
+    batch_size::Int
+    beam_ids
+    beam_metadata
+end
+
+output_count(::BeamMaps, cp) = cp.numofbeam
+output_batch_size(layout::BeamMaps) = layout.batch_size
+output_indices(::BeamMaps, batch) = batch.indices
+output_name(::BeamMaps) = :beams
+
+"""`(sky, beam, I/Q/U, active_pixel)` of one beam batch on one ring."""
+function batch_stokes(::BeamMaps, accumulator, geometry, positions, pixels, angles;
+                      rcond, unseen, map_precision)
+    T = real(eltype(accumulator))
+    result = RingConvolution{T}(geometry.ring, geometry.first_pixel, geometry.pixel_count,
+                                positions, pixels, accumulator)
+    return ring_stokes(result, angles; rcond, unseen, precision=map_precision)
+end
+
+"""Device bytes of one ring's accumulators across all beams."""
+accumulator_bytes(cp, T, active_count) =
+    Int128(sizeof(Complex{T})) * cp.numofsky * cp.numofbeam * active_count * 2
+
+extra_record(::BeamMaps, cp, T, active_count, batches) =
+    (; accumulator_bytes=Int64(accumulator_bytes(cp, T, active_count)))
+
+"""Write the layout's attributes and datasets; return its extra ring records."""
+function write_layout!(file, layout::BeamMaps, cp, devices)
+    attrs = attributes(file)
+    attrs["schema"] = "EBCoDeCMB.beam_batched_hdf5.v1"
+    # HDF5.jl reverses dimensions on disk. This deliberately gives h5py the
+    # conventional (sky, beam, stokes, pixel), with pixels contiguous on disk.
+    attrs["disk_axes"] = "sky,beam,stokes,pixel"
+    attrs["julia_axes"] = "pixel,stokes,beam,sky"
+    attrs["numofbeam"] = cp.numofbeam
+    attrs["beam_batch_size"] = layout.batch_size
+    file["beam_ids"] = string.(layout.beam_ids)
+    file["devices"] = devices
+    write_metadata_group!(file, "beam_metadata", layout.beam_metadata)
+    return ("accumulator_bytes",)
+end
+
+function write_metadata_group!(file, name, values)
+    group = create_group(file, name)
+    try
+        for (key, value) in values
+            group[string(key)] = value
+        end
+    finally
+        close(group)
+    end
+end
+
 # All HDF5 access (including callbacks and completion records) uses this one
 # lock. The file stays open until @sync has joined every worker, even on error.
 struct RingWriter
@@ -139,51 +204,40 @@ struct RingWriter
     lock::ReentrantLock
 end
 
-function make_writer(file, cp, plan, rings, batch_size, T, map_precision,
-                     devices, sky_ids, beam_ids, metadata, beam_metadata,
-                     rcond, unseen, l_tile, max_l_tile, memory_fraction, moment_method)
-    attributes(file)["schema"] = "EBCoDeCMB.beam_batched_hdf5.v1"
-    attributes(file)["created_utc"] = string(now(UTC))
-    # HDF5.jl reverses dimensions on disk. This deliberately gives h5py the
-    # conventional (sky, beam, stokes, pixel), with pixels contiguous on disk.
-    attributes(file)["disk_axes"] = "sky,beam,stokes,pixel"
-    attributes(file)["julia_axes"] = "pixel,stokes,beam,sky"
-    attributes(file)["pixel_ordering"] = "RING"
-    attributes(file)["pixel_index_base"] = 1
-    attributes(file)["stokes_order"] = "I,Q,U"
-    attributes(file)["compute_precision"] = string(T)
-    attributes(file)["map_precision"] = string(map_precision)
-    attributes(file)["ebcodecmb_source"] = pathof(Scanvolver)
-    for key in (:nside_output, :lstart, :lstop, :lmax, :bnmax, :κ, :numofsky, :numofbeam)
-        attributes(file)[String(key)] = getproperty(cp, key)
+# Per-ring records every layout keeps, besides completed/device/beta/elapsed.
+const RING_RECORDS = ("hit_count", "active_pixels", "l_tile", "tile_count",
+                      "scan_moment_builds", "ringd_builds", "sky_fft_builds",
+                      "kernel_builds", "beam_applications", "estimated_tile_bytes")
+
+function make_writer(file, layout, cp, plan, rings, T, map_precision, devices,
+                     sky_ids, metadata, settings)
+    attrs = attributes(file)
+    attrs["created_utc"] = string(now(UTC))
+    attrs["pixel_ordering"] = "RING"
+    attrs["pixel_index_base"] = 1
+    attrs["stokes_order"] = "I,Q,U"
+    attrs["compute_precision"] = string(T)
+    attrs["map_precision"] = string(map_precision)
+    attrs["ebcodecmb_source"] = pathof(Scanvolver)
+    for key in (:nside_output, :lstart, :lstop, :lmax, :bnmax, :κ, :numofsky)
+        attrs[String(key)] = getproperty(cp, key)
     end
     for (key, value) in ("beta_max" => plan.beta_max, "beta_order" => plan.beta_order,
-                         "beam_batch_size" => batch_size, "rcond" => rcond,
-                         "unseen" => unseen, "memory_fraction" => memory_fraction,
-                         "l_tile" => string(l_tile), "max_l_tile" => max_l_tile,
-                         "moment_method" => string(moment_method))
-        attributes(file)[key] = value
+                         "rcond" => settings.rcond, "unseen" => settings.unseen,
+                         "memory_fraction" => settings.memory_fraction,
+                         "l_tile" => string(settings.l_tile),
+                         "max_l_tile" => settings.max_l_tile,
+                         "moment_method" => string(settings.moment_method))
+        attrs[key] = value
     end
     file["sky_ids"] = string.(sky_ids)
-    file["beam_ids"] = string.(beam_ids)
-    file["devices"] = devices
-    for (group_name, values) in (("metadata", metadata), ("beam_metadata", beam_metadata))
-        group = create_group(file, group_name)
-        try
-            for (key, value) in values
-                group[string(key)] = value
-            end
-        finally
-            close(group)
-        end
-    end
+    write_metadata_group!(file, "metadata", metadata)
+    extra_records = write_layout!(file, layout, cp, devices)
     group = create_group(file, "rings")
     try
         count = ring_count(cp)
-        first_pixels = [first(ring_pixel_range(cp, r)) for r in 1:count]
-        last_pixels = [last(ring_pixel_range(cp, r)) for r in 1:count]
-        group["pixel_first"] = first_pixels
-        group["pixel_last"] = last_pixels
+        group["pixel_first"] = [first(ring_pixel_range(cp, r)) for r in 1:count]
+        group["pixel_last"] = [last(ring_pixel_range(cp, r)) for r in 1:count]
         requested = zeros(UInt8, count)
         requested[rings] .= 1
         group["requested"] = requested
@@ -191,25 +245,23 @@ function make_writer(file, cp, plan, rings, batch_size, T, map_precision,
         group["device"] = fill(Int32(-1), count)
         group["observed_beta_max"] = fill(NaN, count)
         group["elapsed_seconds"] = zeros(Float64, count)
-        for key in ("hit_count", "active_pixels", "l_tile", "tile_count",
-                    "scan_moment_builds", "ringd_builds", "sky_fft_builds",
-                    "kernel_builds", "beam_applications", "estimated_tile_bytes",
-                    "accumulator_bytes")
+        for key in (RING_RECORDS..., extra_records...)
             group[key] = zeros(Int64, count)
         end
     finally
         close(group)
     end
     file["run_state"] = UInt8[0]
-    attributes(file)["run_state_codes"] = "0=running,1=complete,2=failed"
+    attrs["run_state_codes"] = "0=running,1=complete,2=failed"
     records = Dict(key => file["rings/$key"] for key in
-        ("completed", "device", "observed_beta_max", "elapsed_seconds", "hit_count", "active_pixels",
-         "l_tile", "tile_count", "scan_moment_builds", "ringd_builds", "sky_fft_builds",
-         "kernel_builds", "beam_applications", "estimated_tile_bytes", "accumulator_bytes"))
-    dims = (cp.resol.numOfPixels, 3, cp.numofbeam, cp.numofsky)
-    chunk = (min(4cp.nside_output, 1024), 3, min(batch_size, cp.numofbeam), min(cp.numofsky, 8))
+        ("completed", "device", "observed_beta_max", "elapsed_seconds",
+         RING_RECORDS..., extra_records...))
+    outputs = output_count(layout, cp)
+    dims = (cp.resol.numOfPixels, 3, outputs, cp.numofsky)
+    chunk = (min(4cp.nside_output, 1024), 3, min(output_batch_size(layout), outputs),
+             min(cp.numofsky, 8))
     map = create_dataset(file, "map", map_precision, dims;
-                         chunk, fill_value=map_precision(unseen))
+                         chunk, fill_value=map_precision(settings.unseen))
     return RingWriter(file, map, records, file["run_state"], ReentrantLock())
 end
 
@@ -219,13 +271,13 @@ function close_writer(writer)
     close(writer.state)
 end
 
-function write_batch!(writer, geometry, beam_indices, stokes, batch_callback)
+function write_batch!(writer, layout, geometry, indices, stokes, batch_callback)
     pixels = geometry.first_pixel:(geometry.first_pixel + geometry.pixel_count - 1)
     lock(writer.lock) do
-        writer.map[pixels, :, beam_indices, :] = permutedims(stokes, (4, 3, 2, 1))
-        batch_callback === nothing || batch_callback((
-            ring=geometry.ring, pixels=pixels, beams=beam_indices, stokes=stokes,
-        ))
+        writer.map[pixels, :, indices, :] = permutedims(stokes, (4, 3, 2, 1))
+        batch_callback === nothing || batch_callback(
+            NamedTuple{(:ring, :pixels, output_name(layout), :stokes)}(
+                (geometry.ring, pixels, indices, stokes)))
     end
 end
 
@@ -245,7 +297,7 @@ function finish_ring!(writer, record, progress_callback; started_ns)
     end
 end
 
-function process_ring!(writer, context, cp, buffer, batches, plan, ring;
+function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
                        l_tile, max_l_tile, memory_fraction, moment_method,
                        rcond, unseen, map_precision, batch_callback, progress_callback)
     T = typeof(plan.beta_max)
@@ -259,13 +311,12 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
         hits = ring_hit_count(buffer, ring)
         observed = check_beta(angles, plan, ring)
         if active === nothing
-            finish_ring!(writer, (
+            finish_ring!(writer, merge((
                 ring=ring, device=context.device, observed_beta_max=observed,
                 hit_count=hits, active_pixels=0, l_tile=0, tile_count=0,
                 scan_moment_builds=0, ringd_builds=0, sky_fft_builds=0,
                 kernel_builds=0, beam_applications=0, estimated_tile_bytes=0,
-                accumulator_bytes=0,
-            ), progress_callback; started_ns)
+            ), extra_record(layout, cp, T, 0, ())), progress_callback; started_ns)
             return nothing
         end
         positions = Int.(Array(active.positions))
@@ -273,8 +324,7 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
         ringd = ringd_blocks_recursion_gpu!(context.ringd, cp, geometry.theta)
         moments = scan_moments_gpu(plan, angles; method=moment_method,
                                    memory_fraction=memory_fraction)
-        accumulator_bytes = Int128(sizeof(Complex{T})) * cp.numofsky * cp.numofbeam * length(active) * 2
-        accumulator_bytes <= memory_fraction * Float64(available_bytes()) ||
+        accumulator_bytes(cp, T, length(active)) <= memory_fraction * Float64(available_bytes()) ||
             throw(ArgumentError("ring $ring: all-beam ring accumulators exceed the memory budget"))
         for batch in batches
             push!(accumulators, CUDA.zeros(Complex{T}, cp.numofsky,
@@ -312,20 +362,20 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
             end
         end
         for (batch, accumulator) in zip(batches, accumulators)
-            result = RingConvolution{T}(ring, geometry.first_pixel, geometry.pixel_count,
-                                        positions, pixels, accumulator)
-            compact = ring_stokes(result, angles; rcond, unseen, precision=map_precision)
-            stokes = fill(map_precision(unseen), cp.numofsky, length(batch.indices), 3, geometry.pixel_count)
+            compact = batch_stokes(layout, accumulator, geometry, positions, pixels, angles;
+                                   rcond, unseen, map_precision)
+            indices = output_indices(layout, batch)
+            stokes = fill(map_precision(unseen), cp.numofsky, length(indices), 3, geometry.pixel_count)
             stokes[:, :, :, positions] = compact
-            write_batch!(writer, geometry, batch.indices, stokes, batch_callback)
+            write_batch!(writer, layout, geometry, indices, stokes, batch_callback)
         end
-        finish_ring!(writer, (
+        finish_ring!(writer, merge((
             ring=ring, device=context.device, observed_beta_max=observed,
             hit_count=hits, active_pixels=length(active), l_tile=width, tile_count=tile_count,
             scan_moment_builds=1, ringd_builds=1, sky_fft_builds=tile_count,
             kernel_builds=tile_count, beam_applications=tile_count * length(batches),
-            estimated_tile_bytes=Int64(tile_bytes), accumulator_bytes=Int64(accumulator_bytes),
-        ), progress_callback; started_ns)
+            estimated_tile_bytes=Int64(tile_bytes),
+        ), extra_record(layout, cp, T, length(active), batches)), progress_callback; started_ns)
     finally
         CUDA.synchronize()
         Scanvolver._release_sky_ring_fft_plans!(plan_cache)
@@ -337,30 +387,12 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
 end
 
 """
-    convolve_to_hdf5(cp, buffer, prepared_alm, prepared_blm; output_path, ...)
-
-Persistent device contexts consume a dynamic ring queue. All skies remain on
-each GPU. Beam intermediates are batch-sized; only one ring's accumulators
-span all beams. Shared K/U are built once per l tile, not per beam batch.
-
-The output file is created only when `output_path` does not exist. Failures
-propagate after every GPU worker has joined; completed rings remain recorded
-in the partial file. This version records progress but does not auto-resume.
-Callbacks run serially; batch_callback receives a borrowed, ring-local CPU
-array after writing it, before that ring is marked complete. No full map is
-allocated or returned. Returns the absolute output path.
+Check what every layout needs; return the ring list, the device list and the
+absolute output path.
 """
-function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
-                         alm::PreparedAlm{T}, blm::PreparedBlm{T};
-                         output_path::AbstractString, beam_batch_size::Integer=9,
-                         devices=[0], rings=buffer.first_ring:buffer.last_ring,
-                         beta_order::Integer=8, l_tile=:auto, max_l_tile::Integer=32,
-                         memory_fraction::Real=0.7, moment_method::Symbol=:gemm,
-                         map_precision::Type=T, rcond::Real=1e-2, unseen::Real=NaN,
-                         reclaim_interval::Integer=16,
-                         sky_ids=string.(1:cp.numofsky), beam_ids=string.(1:cp.numofbeam),
-                         metadata=Dict{String,Any}(), beam_metadata=Dict{String,Any}(),
-                         batch_callback=nothing, progress_callback=nothing) where {T}
+function check_run_inputs(cp, buffer, alm::PreparedAlm{T}, blm::PreparedBlm{T};
+                          map_precision, rings, devices, output_path, l_tile, max_l_tile,
+                          memory_fraction, rcond, unseen, reclaim_interval) where {T}
     cp.HWP && throw(ArgumentError("HWP is not supported"))
     cp.noise && throw(ArgumentError("noise is not supported"))
     T in (Float32, Float64) && map_precision in (Float32, Float64) ||
@@ -372,17 +404,12 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
     alm.numofsky == cp.numofsky && blm.numofbeam == cp.numofbeam && blm.bnmax == cp.bnmax ||
         throw(ArgumentError("prepared sky/beam dimensions do not match cp"))
     buffer.nside == cp.nside_output || throw(ArgumentError("scan-buffer nside does not match cp"))
-    beam_batch_size > 0 && max_l_tile > 0 || throw(ArgumentError("batch and tile sizes must be positive"))
+    max_l_tile > 0 || throw(ArgumentError("batch and tile sizes must be positive"))
     l_tile === :auto || (l_tile isa Integer && l_tile > 0) || throw(ArgumentError("invalid l_tile"))
     isfinite(memory_fraction) && 0 < memory_fraction <= 1 || throw(ArgumentError("invalid memory_fraction"))
     isfinite(rcond) && rcond >= 0 || throw(ArgumentError("invalid rcond"))
     isinf(unseen) && throw(ArgumentError("unseen must be finite or NaN"))
     reclaim_interval >= 0 || throw(ArgumentError("invalid reclaim_interval"))
-    length(sky_ids) == cp.numofsky && length(beam_ids) == cp.numofbeam || throw(ArgumentError("ID counts do not match cp"))
-    for (key, values) in beam_metadata
-        values isa AbstractVector && length(values) == cp.numofbeam ||
-            throw(ArgumentError("beam metadata $key must have one value per beam"))
-    end
     ring_list = Int.(collect(rings))
     !isempty(ring_list) && allunique(ring_list) &&
         all(r -> buffer.first_ring <= r <= buffer.last_ring, ring_list) ||
@@ -394,7 +421,17 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
     path = abspath(output_path)
     ispath(path) && throw(ArgumentError("output already exists: $path"))
     isdir(dirname(path)) || throw(ArgumentError("output directory does not exist"))
-    batches = beam_batches(blm, beam_batch_size)
+    return ring_list, device_list, path
+end
+
+"""
+Run every requested ring of `layout` and write the HDF5 file at `path`.
+Persistent device contexts consume a dynamic ring queue.
+"""
+function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, ring_list,
+                   device_list; beta_order, l_tile, max_l_tile, memory_fraction,
+                   moment_method, map_precision, rcond, unseen, reclaim_interval,
+                   sky_ids, metadata, batch_callback, progress_callback) where {T}
     plan = automatic_scan_plan(cp; beta_order, precision=T)
     table = build_wigner_chebyshev_table_cpu(cp, plan)
     contexts = []
@@ -404,10 +441,10 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
             push!(contexts, prepare_context(cp, alm, table, device, T))
         end
         h5open(path, "w") do file
-            writer = make_writer(file, cp, plan, ring_list, Int(beam_batch_size), T,
-                                 map_precision, device_list, sky_ids, beam_ids, metadata,
-                                 beam_metadata, rcond, unseen, l_tile, max_l_tile,
-                                 memory_fraction, moment_method)
+            writer = make_writer(file, layout, cp, plan, ring_list, T, map_precision,
+                                 device_list, sky_ids, metadata,
+                                 (; rcond, unseen, l_tile, max_l_tile, memory_fraction,
+                                    moment_method))
             next_ring = Threads.Atomic{Int}(1)
             failed = Threads.Atomic{Bool}(false)
             try
@@ -419,9 +456,10 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
                             while !failed[]
                                 index = Threads.atomic_add!(next_ring, 1)
                                 index > length(ring_list) && break
-                                process_ring!(writer, context, cp, buffer, batches, plan, ring_list[index];
-                                              l_tile, max_l_tile, memory_fraction, moment_method,
-                                              rcond, unseen, map_precision, batch_callback, progress_callback)
+                                process_ring!(writer, layout, context, cp, buffer, batches, plan,
+                                              ring_list[index]; l_tile, max_l_tile,
+                                              memory_fraction, moment_method, rcond, unseen,
+                                              map_precision, batch_callback, progress_callback)
                                 processed += 1
                                 if reclaim_interval > 0 && processed % reclaim_interval == 0
                                     CUDA.synchronize()
@@ -450,8 +488,49 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
     return path
 end
 
-"""Read a completed ring as `(sky, beam, I/Q/U, ring_pixel)`; selections are ranges."""
-function read_ring_hdf5(path, ring::Integer; skies=nothing, beams=nothing)
+"""
+    convolve_to_hdf5(cp, buffer, prepared_alm, prepared_blm; output_path, ...)
+
+Persistent device contexts consume a dynamic ring queue. All skies remain on
+each GPU. Beam intermediates are batch-sized; only one ring's accumulators
+span all beams. Shared K/U are built once per l tile, not per beam batch.
+
+The output file is created only when `output_path` does not exist. Failures
+propagate after every GPU worker has joined; completed rings remain recorded
+in the partial file. This version records progress but does not auto-resume.
+Callbacks run serially; batch_callback receives a borrowed, ring-local CPU
+array after writing it, before that ring is marked complete. No full map is
+allocated or returned. Returns the absolute output path.
+"""
+function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
+                         alm::PreparedAlm{T}, blm::PreparedBlm{T};
+                         output_path::AbstractString, beam_batch_size::Integer=9,
+                         devices=[0], rings=buffer.first_ring:buffer.last_ring,
+                         beta_order::Integer=8, l_tile=:auto, max_l_tile::Integer=32,
+                         memory_fraction::Real=0.7, moment_method::Symbol=:gemm,
+                         map_precision::Type=T, rcond::Real=1e-2, unseen::Real=NaN,
+                         reclaim_interval::Integer=16,
+                         sky_ids=string.(1:cp.numofsky), beam_ids=string.(1:cp.numofbeam),
+                         metadata=Dict{String,Any}(), beam_metadata=Dict{String,Any}(),
+                         batch_callback=nothing, progress_callback=nothing) where {T}
+    ring_list, device_list, path = check_run_inputs(
+        cp, buffer, alm, blm; map_precision, rings, devices, output_path, l_tile,
+        max_l_tile, memory_fraction, rcond, unseen, reclaim_interval)
+    beam_batch_size > 0 || throw(ArgumentError("batch and tile sizes must be positive"))
+    length(sky_ids) == cp.numofsky && length(beam_ids) == cp.numofbeam || throw(ArgumentError("ID counts do not match cp"))
+    for (key, values) in beam_metadata
+        values isa AbstractVector && length(values) == cp.numofbeam ||
+            throw(ArgumentError("beam metadata $key must have one value per beam"))
+    end
+    layout = BeamMaps(Int(beam_batch_size), beam_ids, beam_metadata)
+    return run_rings(layout, cp, buffer, alm, blm, beam_batches(blm, beam_batch_size), path,
+                     ring_list, device_list; beta_order, l_tile, max_l_tile, memory_fraction,
+                     moment_method, map_precision, rcond, unseen, reclaim_interval, sky_ids,
+                     metadata, batch_callback, progress_callback)
+end
+
+"""Read a completed ring as `(sky, output, I/Q/U, ring_pixel)`; selections are ranges."""
+function read_ring_maps(path, ring::Integer, skies, outputs, label)
     return h5open(path, "r") do file
         completed = read(file["rings/completed"])
         1 <= ring <= length(completed) && completed[ring] == 1 ||
@@ -461,14 +540,18 @@ function read_ring_hdf5(path, ring::Integer; skies=nothing, beams=nothing)
         dataset = file["map"]
         try
             sky_range = skies === nothing ? (1:size(dataset, 4)) : skies
-            beam_range = beams === nothing ? (1:size(dataset, 3)) : beams
-            sky_range isa AbstractUnitRange && beam_range isa AbstractUnitRange ||
-                throw(ArgumentError("sky/beam selections must be ranges"))
-            return permutedims(dataset[first_pixel:last_pixel, :, beam_range, sky_range], (4, 3, 2, 1))
+            output_range = outputs === nothing ? (1:size(dataset, 3)) : outputs
+            sky_range isa AbstractUnitRange && output_range isa AbstractUnitRange ||
+                throw(ArgumentError("sky/$label selections must be ranges"))
+            return permutedims(dataset[first_pixel:last_pixel, :, output_range, sky_range], (4, 3, 2, 1))
         finally
             close(dataset)
         end
     end
 end
+
+"""Read a completed ring as `(sky, beam, I/Q/U, ring_pixel)`; selections are ranges."""
+read_ring_hdf5(path, ring::Integer; skies=nothing, beams=nothing) =
+    read_ring_maps(path, ring, skies, beams, "beam")
 
 end # module

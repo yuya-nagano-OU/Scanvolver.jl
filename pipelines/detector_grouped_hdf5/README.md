@@ -1,8 +1,9 @@
 # Detector-grouped HDF5 pipeline
 
-This pipeline is separate from `beam_batched_hdf5`. It convolves every input
-detector beam, combines detector sufficient statistics, and performs one
-mapmaking solve per physical detector group.
+This pipeline convolves every input detector beam, combines detector sufficient
+statistics, and performs one mapmaking solve per physical detector group. The
+ring queue, tiling and HDF5 bookkeeping are those of `beam_batched_hdf5`; only
+the per-batch solve and the file metadata differ.
 
 The default consecutive input order is `Qp, Qm, Up, Um`, with detector
 orientation offsets `0, pi/2, pi/4, 3pi/4`. For each group it forms
