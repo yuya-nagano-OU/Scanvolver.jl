@@ -18,8 +18,8 @@ may change before the first stable release.
 - An NVIDIA GPU with a functional CUDA setup for convolution routines
 
 The package can be loaded and its CPU preparation/reference routines can be
-tested without a GPU. Functions whose names end in `_gpu` and the sphere
-convolution drivers require `CUDA.functional() == true`.
+tested without a GPU. Functions whose names end in `_gpu` and the HDF5
+pipelines require `CUDA.functional() == true`.
 
 ## Installation
 
@@ -69,30 +69,32 @@ prepared_alm = prepare_alm(cp, alm_teb)
 prepared_blm = prepare_blm(cp, blm_teb)
 ```
 
-The full GPU pipeline additionally builds a scan buffer, Wigner--Chebyshev
-table, and scan-moment plan before calling `convolve_sphere_gpu` or
-`convolve_sphere_multigpu`. See [`notebook/README.md`](notebook/README.md) for
-the validation notebooks.
+Full-sky convolution runs through the HDF5 pipeline in
+[`pipelines/beam_batched_hdf5`](pipelines/beam_batched_hdf5/README.md).
+`convolve_to_hdf5` takes the configuration, a pixel-ordered scan buffer and the
+prepared skies and beams, convolves every ring on one or more GPUs, and writes
+the `(I, Q, U)` maps of every sky and beam to an HDF5 file ring by ring. See
+[`notebook/README.md`](notebook/README.md) for the validation notebooks.
 
 ## Current scope
 
 - Packed harmonic sky and beam preparation
 - CPU and GPU scan moments
-- CPU and GPU Wigner--Chebyshev tables
+- Wigner--Chebyshev tables built on the CPU and uploaded to the GPU
 - GPU effective-kernel construction and beam application
-- Ring and full-sphere convolution
+- Full-sky convolution to HDF5, with beams processed in batches
+  (`pipelines/beam_batched_hdf5`) or combined into detector groups
+  (`pipelines/detector_grouped_hdf5`)
 - Multi-GPU ring scheduling
-- Binned `(I, Q, U)` mapmaking
-- Checkpoint and resume support
+- Per-pixel `(I, Q, U)` solve for each ring
 
 Current limitations:
 
 - Production convolution requires CUDA; CUDA is not an optional dependency in
   this development release.
 - The current GPU beam preparation and convolution path supports `HWP=false`.
-- Full-map output can be very large for many skies and beams. Use
-  `output=:ring_callback` for streaming workflows or `output=:discard` for
-  benchmarking.
+- The HDF5 pipelines record which rings are complete but do not resume an
+  interrupted run.
 - Julia versions older than 1.12 have not yet been validated.
 
 ## Testing
@@ -105,8 +107,9 @@ Pkg.test()
 ```
 
 GPU tests run when `CUDA.functional()` is true and otherwise skip their GPU
-bodies. The release-preparation branch was validated on Julia 1.12.6 with
-CUDA.jl 6.0.0; all 4,020 tests passed with a functional CUDA device.
+bodies. With a functional CUDA device (Julia 1.12.6, CUDA.jl 6.3.1) all 3,843
+tests pass. The HDF5 pipelines have their own tests under `pipelines/*/test`;
+see the pipeline READMEs.
 
 The GitHub Actions job uses a CPU-only runner without a functional CUDA device.
 A green GitHub Actions run therefore validates the CPU paths and CUDA-less package loading,

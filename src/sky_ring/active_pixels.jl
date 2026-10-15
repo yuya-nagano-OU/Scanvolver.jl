@@ -82,11 +82,6 @@ function ActiveRingPixels(
     )
 end
 
-function _free_active_ring_pixels!(active::ActiveRingPixels)
-    CUDA.unsafe_free!(active.positions)
-    return nothing
-end
-
 function _gather_active_sky_ring_kernel!(
     active,
     full,

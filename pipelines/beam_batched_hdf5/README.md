@@ -20,7 +20,7 @@ SCANVOLVER_PIPELINE_TEST_OUTPUT="$SCANVOLVER_SMALL_OUTPUT" "$SCANVOLVER_JULIA" -
 "$SCANVOLVER_PYTHON" pipelines/beam_batched_hdf5/test/verify_h5py.py "$SCANVOLVER_SMALL_OUTPUT"
 ```
 
-`test_beam_batched_pipeline.jl` は入力を内部生成し、nside=8、2 skies、5 beamsをbatch 1/2/5、Float32/Float64、1/2 GPUで比較する。beam_batch_size を変えると、縮約の行列積（`src/convolution/contraction.jl` の `gemm_strided_batched!`）の出力列数が変わってcuBLAS 内部の加算順序が変わるため、結果は丸めの範囲で変わる（beam を掛ける段 `apply_beams_gemm_gpu` の出力は batch によらずビット単位で同じ）。そのため比較は許容誤差で行う。
+`test_beam_batched_pipeline.jl` は入力を内部生成し、nside=8、2 skies、5 beamsをbatch 1/2/5、Float32/Float64、1/2 GPUで計算して、各段の CPU 参照実装（`test/cpu_reference.jl`）から組み立てた map と比較する。beam_batch_size を変えると、縮約の行列積（`src/convolution/contraction.jl` の `gemm_strided_batched!`）の出力列数が変わってcuBLAS 内部の加算順序が変わるため、結果は丸めの範囲で変わる（beam を掛ける段 `apply_beams_gemm_gpu` の出力は batch によらずビット単位で同じ）。そのため比較は許容誤差で行う。
 
 出力は `metrics.toml`、HDF5 map、参照mapの `.npy`、Python検証の `h5py_verification.json`。参照との比較に限り、テスト側では小規模の全空mapをRAMに読み込む。pipelineにはこの割当てはない。`test-output/` と専用 `Manifest.toml` はgitignore対象で、検証時のManifestは検証したマシンに残す。
 

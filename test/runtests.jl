@@ -4,6 +4,75 @@ using Healpix: Alm, almIndex, alm2map, numberOfAlms
 using LinearAlgebra: cond
 using Test
 
+include("cpu_reference.jl")
+
+# GPU conveniences for the tests. The HDF5 pipelines do the same inline.
+
+"""ringD at one colatitude from a fresh context, as a device array the caller owns."""
+function _ringd_gpu(cp, beta; precision=Float64)
+    context = ringd_context(cp; precision=precision)
+    try
+        ringd = copy(ringd_blocks_recursion_gpu!(context, cp, beta))
+        CUDA.synchronize()
+        return ringd
+    finally
+        free_ringd_context!(context)
+    end
+end
+
+"""One effective-beam tile: the beam-independent kernel, then every beam."""
+function _effective_beam_gpu(table, moments, blm, l_first, l_last)
+    kernel = build_effective_kernel_gpu(table, moments, l_first, l_last)
+    try
+        return apply_beams_gemm_gpu(table, kernel, blm, l_first, l_last)
+    finally
+        CUDA.synchronize()
+        CUDA.unsafe_free!(kernel)
+    end
+end
+
+"""
+One ring through the stages the pipelines' `process_ring!` calls, in the same
+order but without beam batching. The caller owns `result.accumulated`.
+"""
+function _convolve_ring_stages(
+    cp, geometry, active, angles, alm, blm, table, plan;
+    l_tile, moment_method=:gemm,
+)
+    T = typeof(plan.beta_max)
+    context = ringd_context(cp; precision=T)
+    plan_cache = Scanvolver._SkyRingFFTPlanCache()
+    moments = nothing
+    try
+        ringd = ringd_blocks_recursion_gpu!(context, cp, geometry.theta)
+        moments = scan_moments_gpu(plan, angles; method=moment_method)
+        accumulated = CUDA.zeros(Complex{T}, cp.numofsky, cp.numofbeam, length(active), 2)
+        for l_first in cp.lstart:l_tile:cp.lstop
+            l_last = min(l_first + l_tile - 1, cp.lstop)
+            kernel = build_effective_kernel_gpu(table, moments, l_first, l_last)
+            sky = build_sky_ring_gpu(
+                cp, ringd, alm, geometry.phi_pixels, l_first, l_last; plan_cache=plan_cache,
+            )
+            active_sky = select_active_sky_ring_gpu(sky, active)
+            effective = apply_beams_gemm_gpu(table, kernel, blm, l_first, l_last)
+            accumulate_convolution_tile_gemm_gpu!(accumulated, active_sky, effective)
+            CUDA.synchronize()
+            free_active_sky_ring!(active_sky, sky)
+            foreach(CUDA.unsafe_free!, (effective, sky, kernel))
+        end
+        positions = Int.(Array(active.positions))
+        return RingConvolution{T}(
+            geometry.ring, geometry.first_pixel, geometry.pixel_count,
+            positions, geometry.first_pixel .+ positions .- 1, accumulated,
+        )
+    finally
+        CUDA.synchronize()
+        Scanvolver._release_sky_ring_fft_plans!(plan_cache)
+        moments === nothing || CUDA.unsafe_free!(moments)
+        free_ringd_context!(context)
+    end
+end
+
 @testset "ConvolutionParams" begin
     cp = ConvolutionParams(nside_output=1)
     @test cp.nside_output == 1
@@ -651,79 +720,6 @@ end
     end
 end
 
-function _effective_beam_cpu_reference(
-    table,
-    moments,
-    blm,
-    l_first,
-    l_last,
-)
-    T = typeof(table.beta_max)
-    Mmax = maximum(abs, Int.(table.pair_M))
-    M_count = 2 * Mmax + 1
-    tile_count = l_last - l_first + 1
-    pixel_count = size(moments, 5)
-    output = zeros(
-        Complex{T},
-        3 * M_count * tile_count,
-        blm.numofbeam,
-        pixel_count,
-        2,
-    )
-    pair_lookup = Dict(
-        (Int(M), Int(n)) => pair_index
-        for (pair_index, (M, n)) in enumerate(zip(table.pair_M, table.pair_n))
-    )
-
-    for (tile_index, l) in enumerate(l_first:l_last)
-        l_index = l - table.lstart + 1
-        nmax_l = min(table.nmax, l)
-        blocks = blm_slice(blm, l)
-        for M in -min(Mmax, l):min(Mmax, l)
-            M_index = M + Mmax + 1
-            for n in max(-nmax_l, M - table.kappa):min(nmax_l, M + table.kappa)
-                pair_index = pair_lookup[(M, n)]
-                delta_index = M - n + table.kappa + 1
-                n_index = n + table.nmax + 1
-                local_n_index = n + nmax_l + 1
-                for pixel_index in 1:pixel_count,
-                    scan_weight in 1:2
-                    locald = sum(
-                        table.coefficients[
-                            beta_index,
-                            pair_index,
-                            l_index,
-                        ] * moments[
-                            scan_weight,
-                            beta_index,
-                            delta_index,
-                            n_index,
-                            pixel_index,
-                        ]
-                        for beta_index in axes(table.coefficients, 1)
-                    )
-                    for beam_index in 1:blm.numofbeam,
-                        spin_index in 1:3
-                        term_index = spin_index + 3 * (
-                            M_index - 1 + M_count * (tile_index - 1)
-                        )
-                        output[
-                            term_index,
-                            beam_index,
-                            pixel_index,
-                            scan_weight,
-                        ] += locald * blocks[spin_index][
-                            local_n_index,
-                            beam_index,
-                        ]
-                    end
-                end
-            end
-        end
-    end
-    return output
-end
-
 @testset "Effective beam GPU" begin
     cp = ConvolutionParams(
         nside_output=2,
@@ -786,8 +782,6 @@ end
             l_last = 5
             effective_kernel = nothing
             effective = nothing
-            wrapped = nothing
-            profiled = nothing
             try
                 effective_kernel = CUDA.@sync build_effective_kernel_gpu(
                     device_table,
@@ -821,38 +815,6 @@ end
                 @test Array(effective) ≈
                     expected atol=tolerance rtol=tolerance
 
-                wrapped = CUDA.@sync build_effective_beam_gpu(
-                    device_table,
-                    moments_device,
-                    prepared_blm,
-                    l_first,
-                    l_last,
-                )
-                @test Array(wrapped) ≈
-                    expected atol=tolerance rtol=tolerance
-
-                timing_records = NamedTuple[]
-                profiled = CUDA.@sync build_effective_beam_gpu(
-                    device_table,
-                    moments_device,
-                    prepared_blm,
-                    l_first,
-                    l_last;
-                    timing_callback=record -> push!(timing_records, record),
-                )
-                @test Array(profiled) == Array(wrapped)
-                @test length(timing_records) == 1
-                timing = only(timing_records)
-                @test timing.effective_kernel_seconds >= 0
-                @test timing.blm_upload_seconds >= 0
-                @test timing.beam_apply_seconds >= 0
-                @test timing.effective_beam_seconds ==
-                    timing.effective_kernel_seconds +
-                    timing.blm_upload_seconds +
-                    timing.beam_apply_seconds
-                @test timing.effective_beam_wall_seconds >=
-                    timing.effective_beam_seconds
-
                 reused = CUDA.@sync apply_beams_gemm_gpu(
                     device_table,
                     effective_kernel,
@@ -880,64 +842,12 @@ end
                 effective_kernel === nothing ||
                     CUDA.unsafe_free!(effective_kernel)
                 effective === nothing || CUDA.unsafe_free!(effective)
-                wrapped === nothing || CUDA.unsafe_free!(wrapped)
-                profiled === nothing || CUDA.unsafe_free!(profiled)
                 CUDA.unsafe_free!(moments_device)
                 CUDA.unsafe_free!(device_table.coefficients)
                 CUDA.unsafe_free!(device_table.pair_lookup)
             end
         end
     end
-end
-
-function _sky_ring_cpu_reference(
-    cp,
-    ringd,
-    alm,
-    phi_pixels,
-    l_first,
-    l_last,
-)
-    T = typeof(real(zero(eltype(alm))))
-    Mmax_global = calc_Mmax(cp, cp.lstop)
-    M_count = 2 * Mmax_global + 1
-    tile_count = l_last - l_first + 1
-    output = zeros(
-        Complex{T},
-        alm.numofsky,
-        3 * M_count * tile_count,
-        length(phi_pixels),
-    )
-    for (tile_index, l) in enumerate(l_first:l_last)
-        l_index = l - cp.lstart + 1
-        Mmax_l = calc_Mmax(cp, l)
-        blocks = alm_slice(alm, l)
-        for (pixel_index, phi) in enumerate(phi_pixels),
-            M in -Mmax_l:Mmax_l,
-            spin_index in 1:3,
-            sky_index in 1:alm.numofsky
-            value = zero(Complex{T})
-            for m in -l:l
-                value +=
-                    ringd[
-                        m + l + 1,
-                        M + Mmax_l + 1,
-                        l_index,
-                    ] * blocks[spin_index][
-                        sky_index,
-                        m + l + 1,
-                    ] * cis(T(m) * T(phi))
-            end
-            spin_weight = spin_index == 1 ? one(T) : T(0.5)
-            M_index = M + Mmax_global + 1
-            term_index = spin_index + 3 * (
-                M_index - 1 + M_count * (tile_index - 1)
-            )
-            output[sky_index, term_index, pixel_index] =
-                spin_weight * value
-        end
-    end
-    return output
 end
 
 @testset "Sky ring GPU" begin
@@ -1011,7 +921,7 @@ end
                 ])
             end
 
-            ringd = CUDA.@sync ringd_blocks_recursion_gpu(
+            ringd = CUDA.@sync _ringd_gpu(
                 cp,
                 0.73;
                 precision=precision,
@@ -1108,37 +1018,6 @@ end
         prepared = prepare_alm(cp, raw_alms)
         @test_throws ArgumentError upload_alm_gpu(prepared)
     end
-end
-
-function _convolution_tile_cpu_reference(
-    accumulated,
-    sky_ring,
-    effective_beam,
-)
-    expected = copy(accumulated)
-    sky_count, term_count, pixel_count = size(sky_ring)
-    beam_count = size(effective_beam, 2)
-    for scan_weight in 1:size(effective_beam, 4),
-        pixel_index in 1:pixel_count,
-        beam_index in 1:beam_count,
-        sky_index in 1:sky_count
-        expected[
-            sky_index,
-            beam_index,
-            pixel_index,
-            scan_weight,
-        ] += sum(
-            sky_ring[sky_index, term_index, pixel_index] *
-            effective_beam[
-                term_index,
-                beam_index,
-                pixel_index,
-                scan_weight,
-            ]
-            for term_index in 1:term_count
-        )
-    end
-    return expected
 end
 
 function _synthetic_convolution_tile_inputs(
@@ -1267,7 +1146,7 @@ end
             @test sum(angle.num for angle in angles) ==
                 length(hit_positions) * hits_per_pixel
         finally
-            Scanvolver._free_active_ring_pixels!(active)
+            CUDA.unsafe_free!(active.positions)
         end
 
         # A ring with no hits.
@@ -1307,7 +1186,7 @@ end
             @test full_active.complete == true
             @test length(full_angles) == full_geometry.pixel_count
         finally
-            Scanvolver._free_active_ring_pixels!(full_active)
+            CUDA.unsafe_free!(full_active.positions)
         end
     end
 
@@ -1437,8 +1316,8 @@ end
                 @test ring_hit_count(buffer, ring) ==
                     sum(angle.num for angle in direct_angles)
             finally
-                Scanvolver._free_active_ring_pixels!(direct_active)
-                Scanvolver._free_active_ring_pixels!(buffered_active)
+                CUDA.unsafe_free!(direct_active.positions)
+                CUDA.unsafe_free!(buffered_active.positions)
             end
         end
 
@@ -1486,8 +1365,8 @@ end
                         _angle_samples(angles2[index])
                 end
             finally
-                Scanvolver._free_active_ring_pixels!(a1)
-                Scanvolver._free_active_ring_pixels!(a2)
+                CUDA.unsafe_free!(a1.positions)
+                CUDA.unsafe_free!(a2.positions)
             end
         end
 
@@ -1542,90 +1421,6 @@ end
             theta,
             psi,
         )
-    end
-end
-
-@testset "Ring scan buffer convolution" begin
-    cp = ConvolutionParams(
-        nside_output=8,
-        lstart=0,
-        lstop=6,
-        lmax=6,
-        bnmax=2,
-        κ=2,
-        numofsky=1,
-        numofbeam=1,
-    )
-    ring = 6
-    phi, theta, psi = _multi_ring_tod(cp, 5:7, 1:2:16, 6)
-    coefficient_count = (cp.lmax + 1) * (cp.lmax + 2) ÷ 2
-    raw = ComplexF64[
-        complex(
-            sin(0.2 * spin + 0.3 * coefficient),
-            cos(0.4 * spin - 0.1 * coefficient),
-        )
-        for spin in 1:3, coefficient in 1:coefficient_count
-    ]
-
-    if CUDA.functional()
-        geometry = ring_geometry(cp, ring)
-        buffer = build_ring_scan_buffer(cp, phi, theta, psi)
-        direct_active, direct_angles =
-            make_ring_angles(cp, geometry, phi, theta, psi)
-        buffered_active, buffered_angles =
-            make_ring_angles(cp, geometry, buffer)
-        beta_max = 1.05 * maximum(
-            maximum(angle.β)
-            for angle in direct_angles
-        )
-        plan = ScanMomentPlan(
-            kappa=cp.κ,
-            nmax=calc_nmax(cp, cp.lstop),
-            beta_order=10,
-            beta_max=beta_max,
-            precision=Float64,
-        )
-        device_table = upload_wigner_table_gpu(
-            build_wigner_chebyshev_table_cpu(cp, plan),
-        )
-        alm_gpu = upload_alm_gpu(prepare_alm(cp, raw; precision=Float64))
-        prepared_blm = prepare_blm(cp, raw; precision=Float64)
-        direct_result = nothing
-        buffered_result = nothing
-        try
-            direct_result = convolve_ring_gpu(
-                cp, geometry, direct_active, direct_angles,
-                alm_gpu, prepared_blm, device_table, plan; l_tile=3,
-            )
-            buffered_result = convolve_ring_gpu(
-                cp, geometry, buffered_active, buffered_angles,
-                alm_gpu, prepared_blm, device_table, plan; l_tile=3,
-            )
-            @test buffered_result.pixels == direct_result.pixels
-
-            direct_map = allocate_stokes_map(cp)
-            buffered_map = allocate_stokes_map(cp)
-            binning_mapmake!(direct_map, direct_result, direct_angles)
-            binning_mapmake!(buffered_map, buffered_result, buffered_angles)
-            pixels = direct_result.pixels
-            @test all(isfinite, direct_map[:, :, :, pixels])
-            # Only the summation order differs, so the maps agree to a few ulp.
-            @test maximum(
-                abs,
-                buffered_map[:, :, :, pixels] .-
-                direct_map[:, :, :, pixels],
-            ) < 1e-12 * maximum(abs, direct_map[:, :, :, pixels])
-        finally
-            direct_result === nothing ||
-                free_ring_convolution!(direct_result)
-            buffered_result === nothing ||
-                free_ring_convolution!(buffered_result)
-            Scanvolver._free_active_ring_pixels!(direct_active)
-            Scanvolver._free_active_ring_pixels!(buffered_active)
-            CUDA.unsafe_free!(alm_gpu.values)
-            CUDA.unsafe_free!(device_table.coefficients)
-            CUDA.unsafe_free!(device_table.pair_lookup)
-        end
     end
 end
 
@@ -1747,8 +1542,8 @@ end
                 end
             end
         finally
-            Scanvolver._free_active_ring_pixels!(partial)
-            Scanvolver._free_active_ring_pixels!(complete)
+            CUDA.unsafe_free!(partial.positions)
+            CUDA.unsafe_free!(complete.positions)
         end
     else
         @test_throws ArgumentError ActiveRingPixels([1, 2], 4)
@@ -2070,7 +1865,7 @@ end
                 (scan_moments_cpu(plan, angle) for angle in angles)...;
                 dims=5,
             )
-            ringd = CUDA.@sync ringd_blocks_recursion_gpu(
+            ringd = CUDA.@sync _ringd_gpu(
                 cp,
                 theta_ring;
                 precision=precision,
@@ -2106,7 +1901,7 @@ end
                         l_first,
                         l_last,
                     )
-                    effective = CUDA.@sync build_effective_beam_gpu(
+                    effective = CUDA.@sync _effective_beam_gpu(
                         device_table,
                         moments_device,
                         prepared_blm,
@@ -2277,7 +2072,7 @@ end
                 (scan_moments_cpu(plan, angle) for angle in angles)...;
                 dims=5,
             )
-            ringd = CUDA.@sync ringd_blocks_recursion_gpu(
+            ringd = CUDA.@sync _ringd_gpu(
                 cp,
                 theta_ring;
                 precision=precision,
@@ -2326,7 +2121,7 @@ end
                     @test size(active_sky_ring, 3) ==
                         length(active_positions)
 
-                    effective = CUDA.@sync build_effective_beam_gpu(
+                    effective = CUDA.@sync _effective_beam_gpu(
                         device_table,
                         moments_device,
                         prepared_blm,
@@ -2407,7 +2202,7 @@ end
                 effective === nothing || CUDA.unsafe_free!(effective)
                 accumulated === nothing ||
                     CUDA.unsafe_free!(accumulated)
-                Scanvolver._free_active_ring_pixels!(active)
+                CUDA.unsafe_free!(active.positions)
                 CUDA.unsafe_free!(ringd)
                 CUDA.unsafe_free!(moments_device)
                 CUDA.unsafe_free!(alm_gpu.values)
@@ -2433,54 +2228,6 @@ function _ring_scan_tod(cp, geometry, positions, hits_per_pixel)
     return phi, theta, psi
 end
 
-function _ring_convolution_cpu_reference(
-    cp,
-    geometry,
-    positions,
-    angles,
-    table,
-    prepared_alm,
-    prepared_blm,
-    ringd_host,
-    plan,
-    l_tile,
-)
-    T = typeof(plan.beta_max)
-    moments_host = cat(
-        (scan_moments_cpu(plan, angle) for angle in angles)...;
-        dims=5,
-    )
-    expected = zeros(
-        Complex{T},
-        cp.numofsky,
-        cp.numofbeam,
-        length(positions),
-        2,
-    )
-    for l_first in cp.lstart:l_tile:cp.lstop
-        l_last = min(l_first + l_tile - 1, cp.lstop)
-        expected = _convolution_tile_cpu_reference(
-            expected,
-            _sky_ring_cpu_reference(
-                cp,
-                ringd_host,
-                prepared_alm,
-                geometry.phi_pixels,
-                l_first,
-                l_last,
-            )[:, :, positions],
-            _effective_beam_cpu_reference(
-                table,
-                moments_host,
-                prepared_blm,
-                l_first,
-                l_last,
-            ),
-        )
-    end
-    return expected
-end
-
 @testset "Ring memory model" begin
     cp = ConvolutionParams(
         nside_output=8,
@@ -2501,7 +2248,7 @@ end
     @test estimate.tile_peak >= estimate.effective_beam
 
     # Everything that scales with the tile is linear in it, which is what
-    # suggest_l_tile relies on.
+    # the pipelines' tile sizing relies on.
     unit = ring_memory_bytes(cp, 32, 16, 1)
     for tile in (2, 3, 5, 8)
         scaled = ring_memory_bytes(cp, 32, 16, tile)
@@ -2548,47 +2295,6 @@ end
     @test per_tile * (ceiling + 1) > typemax(Int32)
     @test max_indexable_l_tile(cp, 16) == full_range
     @test_throws ArgumentError max_indexable_l_tile(cp, 0)
-
-    # suggest_l_tile: never above the ceiling, never below one, monotone in the
-    # budget, and honouring an explicit cap.
-    @test suggest_l_tile(cp, 32, 16; available_bytes=1) == 1
-    @test suggest_l_tile(cp, 32, 16; available_bytes=typemax(Int32)) ==
-        full_range
-    @test suggest_l_tile(
-        cp, 32, 16;
-        available_bytes=typemax(Int32),
-        max_tile=3,
-    ) == 3
-    previous = 0
-    for available in (2^20, 2^22, 2^24, 2^26, 2^28)
-        tile = suggest_l_tile(cp, 32, 16; available_bytes=available)
-        @test 1 <= tile <= full_range
-        @test tile >= previous
-        previous = tile
-    end
-    @test suggest_l_tile(
-        big, 2048, 2048;
-        precision=Float32,
-        complete_ring=true,
-        available_bytes=48 * 2^30,
-    ) <= ceiling
-    # reserve_bytes must only ever shrink the answer.
-    @test suggest_l_tile(
-        cp, 32, 16;
-        available_bytes=2^26,
-        reserve_bytes=2^25,
-    ) <= suggest_l_tile(cp, 32, 16; available_bytes=2^26)
-
-    @test_throws ArgumentError suggest_l_tile(
-        cp, 32, 16; memory_fraction=0.0,
-    )
-    @test_throws ArgumentError suggest_l_tile(
-        cp, 32, 16; memory_fraction=1.5,
-    )
-    @test_throws ArgumentError suggest_l_tile(
-        cp, 32, 16; reserve_bytes=-1,
-    )
-    @test_throws ArgumentError suggest_l_tile(cp, 32, 16; max_tile=0)
 
     if CUDA.functional()
         # The estimate must be the actual allocation, byte for byte.
@@ -2645,7 +2351,7 @@ end
         sky_ring = nothing
         active_sky_ring = nothing
         try
-            ringd = ringd_blocks_recursion_gpu(
+            ringd = _ringd_gpu(
                 cp,
                 geometry.theta;
                 precision=Float64,
@@ -2663,7 +2369,7 @@ end
                 1,
                 tile,
             )
-            effective = build_effective_beam_gpu(
+            effective = _effective_beam_gpu(
                 device_table,
                 moments,
                 prepared_blm,
@@ -2699,7 +2405,7 @@ end
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
-            Scanvolver._free_active_ring_pixels!(active)
+            CUDA.unsafe_free!(active.positions)
         end
     end
 end
@@ -2733,13 +2439,13 @@ end
                 )
                 @test occursin("RingDContext{$precision}", sprint(show, context))
 
-                # Refilling must give exactly what a fresh call gives, and a
+                # Refilling must give exactly what a fresh context gives, and a
                 # second ring must leave nothing of the first behind.
                 for ring in (3, 9, 15)
                     theta = ring_geometry(cp, ring).theta
                     reused = ringd_blocks_recursion_gpu!(context, cp, theta)
                     @test reused === context.ringd
-                    fresh = ringd_blocks_recursion_gpu(
+                    fresh = _ringd_gpu(
                         cp,
                         theta;
                         precision=precision,
@@ -2772,143 +2478,6 @@ end
             )
         finally
             free_ringd_context!(context)
-        end
-    end
-end
-
-@testset "Ring convolution tiling and context" begin
-    cp = ConvolutionParams(
-        nside_output=8,
-        lstart=0,
-        lstop=8,
-        lmax=8,
-        bnmax=2,
-        κ=2,
-        numofsky=2,
-        numofbeam=2,
-    )
-    coefficient_count = (cp.lmax + 1) * (cp.lmax + 2) ÷ 2
-    raw_alms = [
-        ComplexF64[
-            complex(sin(0.2 * s + 0.3 * c + k), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for k in 1:cp.numofsky
-    ]
-    raw_blms = [
-        ComplexF64[
-            complex(sin(0.3 * s + 0.2 * c + b), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for b in 1:cp.numofbeam
-    ]
-
-    if CUDA.functional()
-        rings = (4, 9, 14)
-        geometries = [ring_geometry(cp, ring) for ring in rings]
-        scans = [
-            _ring_scan_tod(cp, geometry, 1:2:geometry.pixel_count, 6)
-            for geometry in geometries
-        ]
-        prepared = [
-            make_ring_angles(cp, geometries[index], scans[index]...)
-            for index in eachindex(rings)
-        ]
-        beta_max = 1.05 * maximum(
-            maximum(maximum(angle.β) for angle in entry[2])
-            for entry in prepared
-        )
-        plan = ScanMomentPlan(
-            kappa=cp.κ,
-            nmax=calc_nmax(cp, cp.lstop),
-            beta_order=8,
-            beta_max=beta_max,
-            precision=Float64,
-        )
-        device_table = upload_wigner_table_gpu(
-            build_wigner_chebyshev_table_cpu(cp, plan),
-        )
-        alm_gpu = upload_alm_gpu(prepare_alm(cp, raw_alms; precision=Float64))
-        prepared_blm = prepare_blm(cp, raw_blms; precision=Float64)
-        context = ringd_context(cp; precision=Float64)
-        results = RingConvolution[]
-        try
-            @test_throws ArgumentError convolve_ring_gpu(
-                cp, geometries[1], prepared[1]..., alm_gpu, prepared_blm,
-                device_table, plan; l_tile=:widest,
-            )
-
-            for index in eachindex(rings)
-                active, angles = prepared[index]
-                baseline = convolve_ring_gpu(
-                    cp, geometries[index], active, angles, alm_gpu,
-                    prepared_blm, device_table, plan; l_tile=3,
-                )
-                push!(results, baseline)
-                expected = Array(baseline.accumulated)
-
-                # :auto must choose a valid width and give the same numbers.
-                automatic = convolve_ring_gpu(
-                    cp, geometries[index], active, angles, alm_gpu,
-                    prepared_blm, device_table, plan; l_tile=:auto,
-                )
-                push!(results, automatic)
-                @test Array(automatic.accumulated) ≈
-                    expected rtol=1e-12 atol=1e-12
-
-                # A shared ringD context must not change anything either, and
-                # reusing it across rings must not leak state between them.
-                shared = convolve_ring_gpu(
-                    cp, geometries[index], active, angles, alm_gpu,
-                    prepared_blm, device_table, plan;
-                    l_tile=3, ringd_context=context,
-                )
-                push!(results, shared)
-                @test Array(shared.accumulated) ≈
-                    expected rtol=1e-12 atol=1e-12
-                @test shared.pixels == baseline.pixels
-
-                # A tiny budget must still produce a usable tile.
-                narrow = convolve_ring_gpu(
-                    cp, geometries[index], active, angles, alm_gpu,
-                    prepared_blm, device_table, plan;
-                    l_tile=:auto, memory_fraction=1e-6,
-                    ringd_context=context,
-                )
-                push!(results, narrow)
-                @test Array(narrow.accumulated) ≈
-                    expected rtol=1e-12 atol=1e-12
-            end
-
-            # The context survives every ring and still matches a fresh build.
-            fresh = ringd_blocks_recursion_gpu(
-                cp,
-                geometries[end].theta;
-                precision=Float64,
-            )
-            try
-                @test Array(
-                    ringd_blocks_recursion_gpu!(
-                        context,
-                        cp,
-                        geometries[end].theta,
-                    ),
-                ) == Array(fresh)
-            finally
-                CUDA.unsafe_free!(fresh)
-            end
-        finally
-            for result in results
-                free_ring_convolution!(result)
-            end
-            free_ringd_context!(context)
-            for (active, _) in prepared
-                active === nothing ||
-                    Scanvolver._free_active_ring_pixels!(active)
-            end
-            CUDA.unsafe_free!(alm_gpu.values)
-            CUDA.unsafe_free!(device_table.coefficients)
-            CUDA.unsafe_free!(device_table.pair_lookup)
         end
     end
 end
@@ -2994,16 +2563,11 @@ end
                     precision=precision,
                 )
                 alm_gpu = upload_alm_gpu(prepared_alm)
-                ringd = CUDA.@sync ringd_blocks_recursion_gpu(
-                    cp,
-                    geometry.theta;
-                    precision=precision,
-                )
+                ringd = _ringd_gpu(cp, geometry.theta; precision=precision)
                 ringd_host = Array(ringd)
                 CUDA.unsafe_free!(ringd)
 
                 results = RingConvolution[]
-                convenience = nothing
                 try
                     @test active.complete == (ring == 1)
                     @test length(angles) == length(hit_positions)
@@ -3025,16 +2589,9 @@ end
                     # The same ring must come out identically however the l
                     # range is split into tiles.
                     for l_tile in (6, 3, 2, 1)
-                        result = convolve_ring_gpu(
-                            cp,
-                            geometry,
-                            active,
-                            angles,
-                            alm_gpu,
-                            prepared_blm,
-                            device_table,
-                            plan;
-                            l_tile=l_tile,
+                        result = _convolve_ring_stages(
+                            cp, geometry, active, angles, alm_gpu, prepared_blm,
+                            device_table, plan; l_tile=l_tile,
                         )
                         push!(results, result)
                         @test result isa RingConvolution{precision}
@@ -3066,154 +2623,24 @@ end
                         sprint(show, results[1]),
                     )
 
-                    # The convenience method bins the scan itself and must
-                    # agree with the prepared-scan method.
-                    convenience = convolve_ring_gpu(
-                        cp,
-                        ring,
-                        phi_tod,
-                        theta_tod,
-                        psi_tod,
-                        alm_gpu,
-                        prepared_blm,
-                        device_table,
-                        plan;
-                        l_tile=3,
-                    )
-                    @test convenience.positions == hit_positions
-                    @test Array(convenience.accumulated) ≈
-                        expected rtol=tolerance atol=tolerance
-
                     # Direct scan moments must give the same ring.
-                    direct = convolve_ring_gpu(
-                        cp,
-                        geometry,
-                        active,
-                        angles,
-                        alm_gpu,
-                        prepared_blm,
-                        device_table,
-                        plan;
-                        l_tile=3,
-                        moment_method=:direct,
+                    direct = _convolve_ring_stages(
+                        cp, geometry, active, angles, alm_gpu, prepared_blm,
+                        device_table, plan; l_tile=3, moment_method=:direct,
                     )
                     push!(results, direct)
                     @test Array(direct.accumulated) ≈
                         expected rtol=tolerance atol=tolerance
                 finally
                     for result in results
-                        free_ring_convolution!(result)
+                        CUDA.unsafe_free!(result.accumulated)
                     end
-                    convenience === nothing ||
-                        free_ring_convolution!(convenience)
-                    Scanvolver._free_active_ring_pixels!(active)
+                    CUDA.unsafe_free!(active.positions)
                     CUDA.unsafe_free!(alm_gpu.values)
                     CUDA.unsafe_free!(device_table.coefficients)
                     CUDA.unsafe_free!(device_table.pair_lookup)
                 end
             end
-        end
-    end
-end
-
-@testset "Ring convolution validation" begin
-    cp = ConvolutionParams(
-        nside_output=4,
-        lstart=0,
-        lstop=5,
-        lmax=5,
-        bnmax=2,
-        κ=2,
-        numofsky=1,
-        numofbeam=1,
-    )
-    coefficient_count = (cp.lmax + 1) * (cp.lmax + 2) ÷ 2
-    raw = ComplexF64[
-        complex(
-            sin(0.2 * spin + 0.3 * coefficient),
-            cos(0.4 * spin - 0.1 * coefficient),
-        )
-        for spin in 1:3, coefficient in 1:coefficient_count
-    ]
-
-    if CUDA.functional()
-        ring = 5
-        geometry = ring_geometry(cp, ring)
-        phi_tod, theta_tod, psi_tod = _ring_scan_tod(
-            cp,
-            geometry,
-            [3, 8],
-            5,
-        )
-        active, angles = make_ring_angles(
-            cp,
-            geometry,
-            phi_tod,
-            theta_tod,
-            psi_tod,
-        )
-        beta_max = 1.05 * maximum(
-            maximum(angle.β)
-            for angle in angles
-        )
-        plan = ScanMomentPlan(
-            kappa=cp.κ,
-            nmax=calc_nmax(cp, cp.lstop),
-            beta_order=8,
-            beta_max=beta_max,
-            precision=Float64,
-        )
-        table = build_wigner_chebyshev_table_cpu(cp, plan)
-        device_table = upload_wigner_table_gpu(table)
-        alm_gpu = upload_alm_gpu(prepare_alm(cp, raw; precision=Float64))
-        prepared_blm = prepare_blm(cp, raw; precision=Float64)
-
-        try
-            @test_throws ArgumentError convolve_ring_gpu(
-                cp, geometry, active, angles, alm_gpu, prepared_blm,
-                device_table, plan; l_tile=0,
-            )
-            @test_throws DimensionMismatch convolve_ring_gpu(
-                cp, geometry, active, angles[1:1], alm_gpu,
-                prepared_blm, device_table, plan,
-            )
-
-            # A table and a scan plan from different beta_max would share no
-            # Chebyshev variable; this must be an error, not a wrong result.
-            # beta_max is larger here, so no sample is out of domain.
-            wider = ScanMomentPlan(
-                kappa=cp.κ,
-                nmax=calc_nmax(cp, cp.lstop),
-                beta_order=8,
-                beta_max=2 * beta_max,
-                precision=Float64,
-            )
-            @test_throws ArgumentError convolve_ring_gpu(
-                cp, geometry, active, angles, alm_gpu, prepared_blm,
-                device_table, wider,
-            )
-            coarser = ScanMomentPlan(
-                kappa=cp.κ,
-                nmax=calc_nmax(cp, cp.lstop),
-                beta_order=6,
-                beta_max=beta_max,
-                precision=Float64,
-            )
-            @test_throws ArgumentError convolve_ring_gpu(
-                cp, geometry, active, angles, alm_gpu, prepared_blm,
-                device_table, coarser,
-            )
-
-            # A ring with no hits.
-            @test convolve_ring_gpu(
-                cp, 2, phi_tod, theta_tod, psi_tod, alm_gpu,
-                prepared_blm, device_table, plan,
-            ) === nothing
-        finally
-            Scanvolver._free_active_ring_pixels!(active)
-            CUDA.unsafe_free!(alm_gpu.values)
-            CUDA.unsafe_free!(device_table.coefficients)
-            CUDA.unsafe_free!(device_table.pair_lookup)
         end
     end
 end
@@ -3284,502 +2711,9 @@ function _synthetic_ring_convolution(
     )
 end
 
-@testset "Full sphere driver" begin
-    cp = ConvolutionParams(
-        nside_output=8,
-        lstart=0,
-        lstop=8,
-        lmax=8,
-        bnmax=2,
-        κ=2,
-        numofsky=2,
-        numofbeam=2,
-    )
-    scanned_rings = 4:12
-    coefficient_count = (cp.lmax + 1) * (cp.lmax + 2) ÷ 2
-    raw_alms = [
-        ComplexF64[
-            complex(sin(0.2 * s + 0.3 * c + k), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for k in 1:cp.numofsky
-    ]
-    raw_blms = [
-        ComplexF64[
-            complex(sin(0.3 * s + 0.2 * c + b), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for b in 1:cp.numofbeam
-    ]
-
-    if CUDA.functional()
-        phi, theta, psi = _multi_ring_tod(cp, scanned_rings, 1:2:24, 6)
-        buffer = build_ring_scan_buffer(cp, phi, theta, psi)
-
-        geometry = ring_geometry(cp, first(scanned_rings))
-        probe_active, probe_angles = make_ring_angles(cp, geometry, buffer)
-        beta_max = 3 * maximum(
-            maximum(angle.β)
-            for angle in probe_angles
-        )
-        Scanvolver._free_active_ring_pixels!(probe_active)
-        plan = ScanMomentPlan(
-            kappa=cp.κ,
-            nmax=calc_nmax(cp, cp.lstop),
-            beta_order=8,
-            beta_max=beta_max,
-            precision=Float64,
-        )
-        device_table = upload_wigner_table_gpu(
-            build_wigner_chebyshev_table_cpu(cp, plan),
-        )
-        alm_gpu = upload_alm_gpu(prepare_alm(cp, raw_alms; precision=Float64))
-        prepared_blm = prepare_blm(cp, raw_blms; precision=Float64)
-
-        try
-            # Reference: drive the rings by hand.
-            reference = allocate_stokes_map(cp)
-            reference_pixels = Int[]
-            for ring in 1:ring_count(cp)
-                ring_geo = ring_geometry(cp, ring)
-                active, angles = make_ring_angles(cp, ring_geo, buffer)
-                active === nothing && continue
-                result = nothing
-                try
-                    result = convolve_ring_gpu(
-                        cp, ring_geo, active, angles, alm_gpu,
-                        prepared_blm, device_table, plan; l_tile=3,
-                    )
-                    binning_mapmake!(reference, result, angles)
-                    append!(reference_pixels, result.pixels)
-                finally
-                    result === nothing || free_ring_convolution!(result)
-                    Scanvolver._free_active_ring_pixels!(active)
-                end
-            end
-
-            progress = NamedTuple[]
-            full_map = convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                progress_callback=record -> push!(progress, record),
-                reclaim_interval=4,
-            )
-            @test size(full_map) == (
-                cp.numofsky,
-                cp.numofbeam,
-                3,
-                cp.resol.numOfPixels,
-            )
-            @test full_map[:, :, :, reference_pixels] ==
-                reference[:, :, :, reference_pixels]
-            untouched = [
-                pixel
-                for pixel in 1:cp.resol.numOfPixels
-                if !(pixel in Set(reference_pixels))
-            ]
-            @test all(isnan, full_map[:, :, :, untouched])
-
-            # Every ring is reported, hit or not, and the processed count only
-            # advances on rings that had hits.
-            @test length(progress) == ring_count(cp)
-            @test [record.ring for record in progress] == 1:ring_count(cp)
-            @test all(record.ring_total == ring_count(cp) for record in progress)
-            @test progress[end].processed_rings == length(scanned_rings)
-            @test progress[1].active_pixels == 0
-            @test progress[1].hit_count == 0
-            scanned = filter(
-                record -> record.ring in scanned_rings,
-                progress,
-            )
-            @test all(record.active_pixels > 0 for record in scanned)
-            @test sum(record.hit_count for record in scanned) ==
-                length(buffer)
-            @test issorted([record.elapsed_seconds for record in progress])
-
-            # The ring callback must carry the same numbers, bounded per ring.
-            delivered = Dict{Int,Any}()
-            @test convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                output=:ring_callback,
-                ring_callback=payload -> (delivered[payload.ring] = payload),
-            ) === nothing
-            @test sort(collect(keys(delivered))) == collect(scanned_rings)
-            for (ring, payload) in delivered
-                @test size(payload.stokes) == (
-                    cp.numofsky,
-                    cp.numofbeam,
-                    3,
-                    length(payload.pixels),
-                )
-                @test payload.stokes ==
-                    reference[:, :, :, payload.pixels]
-            end
-
-            @test convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3, output=:discard, reclaim_interval=0,
-            ) === nothing
-
-            # A ring subset, a shared context, Float32 output and :auto tiles.
-            context = ringd_context(cp; precision=Float64)
-            try
-                subset = convolve_sphere_gpu(
-                    cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                    rings=6:8,
-                    map_precision=Float32,
-                    ringd_context=context,
-                )
-                @test eltype(subset) === Float32
-                subset_pixels = vcat([
-                    collect(ring_pixel_range(cp, ring)[1]:ring_pixel_range(cp, ring)[2])
-                    for ring in 6:8
-                ]...)
-                outside = [
-                    pixel
-                    for pixel in 1:cp.resol.numOfPixels
-                    if !(pixel in Set(subset_pixels))
-                ]
-                @test all(isnan, subset[:, :, :, outside])
-                @test any(isfinite, subset[:, :, :, subset_pixels])
-                @test Float64.(
-                    filter(isfinite, subset[:, :, :, subset_pixels]),
-                ) ≈ filter(
-                    isfinite,
-                    reference[:, :, :, subset_pixels],
-                ) rtol=1e-6
-            finally
-                free_ringd_context!(context)
-            end
-
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                output=:everything,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                output=:ring_callback,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                ring_callback=identity,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                reclaim_interval=-1,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                map_precision=Int,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                rings=0:4,
-            )
-            narrow_buffer = build_ring_scan_buffer(
-                cp, phi, theta, psi; rings=6:7,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, narrow_buffer, alm_gpu, prepared_blm, device_table, plan;
-                rings=4:12,
-            )
-            other = ConvolutionParams(
-                nside_output=4, lstop=8, lmax=8, bnmax=2, κ=2,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                other, buffer, alm_gpu, prepared_blm, device_table, plan,
-            )
-        finally
-            CUDA.unsafe_free!(alm_gpu.values)
-            CUDA.unsafe_free!(device_table.coefficients)
-            CUDA.unsafe_free!(device_table.pair_lookup)
-        end
-    end
-end
 
 
-@testset "Sphere checkpoint and multi-GPU" begin
-    # A worker failure is reported only after every sibling worker has joined.
-    worker_finished = Threads.Atomic{Int}(0)
-    worker_error = nothing
-    try
-        Scanvolver._run_sphere_workers((:fail, :finish)) do action
-            if action === :fail
-                error("simulated worker failure")
-            end
-            sleep(0.05)
-            Threads.atomic_add!(worker_finished, 1)
-        end
-    catch exception
-        worker_error = exception
-    end
-    @test worker_error isa CompositeException
-    @test worker_finished[] == 1
-
-    cp = ConvolutionParams(
-        nside_output=8,
-        lstart=0,
-        lstop=8,
-        lmax=8,
-        bnmax=2,
-        κ=2,
-        numofsky=2,
-        numofbeam=2,
-    )
-    scanned_rings = 4:12
-    coefficient_count = (cp.lmax + 1) * (cp.lmax + 2) ÷ 2
-    raw_alms = [
-        ComplexF64[
-            complex(sin(0.2 * s + 0.3 * c + k), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for k in 1:cp.numofsky
-    ]
-    raw_blms = [
-        ComplexF64[
-            complex(sin(0.3 * s + 0.2 * c + b), cos(0.4 * s - 0.1 * c))
-            for s in 1:3, c in 1:coefficient_count
-        ]
-        for b in 1:cp.numofbeam
-    ]
-
-    if CUDA.functional()
-        phi, theta, psi = _multi_ring_tod(cp, scanned_rings, 1:2:24, 6)
-        buffer = build_ring_scan_buffer(cp, phi, theta, psi)
-        geometry = ring_geometry(cp, first(scanned_rings))
-        probe_active, probe_angles = make_ring_angles(cp, geometry, buffer)
-        beta_max = 3 * maximum(
-            maximum(angle.β)
-            for angle in probe_angles
-        )
-        Scanvolver._free_active_ring_pixels!(probe_active)
-        plan = ScanMomentPlan(
-            kappa=cp.κ,
-            nmax=calc_nmax(cp, cp.lstop),
-            beta_order=8,
-            beta_max=beta_max,
-            precision=Float64,
-        )
-        host_table = build_wigner_chebyshev_table_cpu(cp, plan)
-        device_table = upload_wigner_table_gpu(host_table)
-        prepared_alm = prepare_alm(cp, raw_alms; precision=Float64)
-        alm_gpu = upload_alm_gpu(prepared_alm)
-        prepared_blm = prepare_blm(cp, raw_blms; precision=Float64)
-        directory = mktempdir()
-
-        try
-            reference = convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-            )
-
-            # Round trip through a file.
-            path = joinpath(directory, "round_trip.ckpt")
-            completed = [isodd(index) for index in 1:ring_count(cp)]
-            signature = ntuple(index -> UInt8(index), 32)
-            saved = SphereCheckpoint(
-                1,
-                ring_count(cp),
-                completed,
-                reference,
-                signature,
-            )
-            @test occursin("SphereCheckpoint{Float64}", sprint(show, saved))
-            save_sphere_checkpoint(path, cp, saved)
-            @test isfile(path)
-            @test !isfile(path * ".tmp")
-            restored = load_sphere_checkpoint(path, cp)
-            @test restored.first_ring == 1
-            @test restored.last_ring == ring_count(cp)
-            @test restored.completed == completed
-            @test restored.signature == signature
-            @test size(restored.stokes_map) == size(reference)
-            finite = isfinite.(reference)
-            @test restored.stokes_map[finite] == reference[finite]
-            @test all(isnan, restored.stokes_map[.!finite])
-            @test_throws ArgumentError load_sphere_checkpoint(
-                path,
-                cp;
-                expected_signature=ntuple(index -> UInt8(index + 1), 32),
-            )
-
-            # A checkpoint from a different problem must not be resumed onto.
-            other = ConvolutionParams(
-                nside_output=8, lstart=0, lstop=8, lmax=8,
-                bnmax=2, κ=2, numofsky=3, numofbeam=2,
-            )
-            @test_throws ArgumentError load_sphere_checkpoint(path, other)
-            garbage = joinpath(directory, "garbage.ckpt")
-            write(garbage, rand(UInt8, 64))
-            @test_throws ArgumentError load_sphere_checkpoint(garbage, cp)
-            @test_throws DimensionMismatch save_sphere_checkpoint(
-                path,
-                cp,
-                SphereCheckpoint(1, 5, fill(false, 3), reference),
-            )
-
-            # Interrupt a run, then resume it and land on the same map.
-            resumable = joinpath(directory, "resume.ckpt")
-            checkpoint_id = "checkpoint-test-input-v1"
-            attempted = Ref(0)
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id="   ",
-            )
-            @test_throws ErrorException convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id=checkpoint_id,
-                checkpoint_interval=2,
-                progress_callback=record -> begin
-                    attempted[] += 1
-                    record.ring_index == 8 && error("simulated interruption")
-                end,
-            )
-            @test isfile(resumable)
-            partial = load_sphere_checkpoint(resumable, cp)
-            @test any(partial.completed)
-            @test !all(partial.completed)
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id="different-input-v1",
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id=checkpoint_id,
-                rcond=1e-3,
-            )
-
-            resumed_rings = Int[]
-            resumed = convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id=checkpoint_id,
-                checkpoint_interval=2,
-                progress_callback=record ->
-                    record.skipped || push!(resumed_rings, record.ring),
-            )
-            @test !isempty(resumed_rings)
-            @test length(resumed_rings) < ring_count(cp)
-            @test resumed[finite] == reference[finite]
-            @test all(isnan, resumed[.!finite])
-
-            # resume=false must start over and still land on the same map.
-            fresh = convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                l_tile=3,
-                checkpoint_path=resumable,
-                checkpoint_id=checkpoint_id,
-                resume=false,
-            )
-            @test fresh[finite] == reference[finite]
-
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                output=:discard, checkpoint_path=resumable,
-                checkpoint_id=checkpoint_id,
-            )
-            @test_throws ArgumentError convolve_sphere_gpu(
-                cp, buffer, alm_gpu, prepared_blm, device_table, plan;
-                checkpoint_interval=-1,
-            )
-
-            # Multi-GPU: the same sphere, whatever the queue hands out.
-            device_count = length(CUDA.devices())
-            for device_set in unique((
-                [0],
-                [0, 0],
-                collect(0:(device_count - 1)),
-            ))
-                seen = Int[]
-                seen_lock = ReentrantLock()
-                parallel = convolve_sphere_multigpu(
-                    cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                    devices=device_set,
-                    l_tile=3,
-                    progress_callback=record -> Base.lock(seen_lock) do
-                        push!(seen, record.ring)
-                    end,
-                )
-                @test parallel[finite] == reference[finite]
-                @test all(isnan, parallel[.!finite])
-                @test sort(seen) == collect(1:ring_count(cp))
-                @test all(record in 0:(device_count - 1) for record in device_set)
-            end
-
-            # Multi-GPU with a bounded ring callback.
-            delivered = Dict{Int,Any}()
-            delivered_lock = ReentrantLock()
-            @test convolve_sphere_multigpu(
-                cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                devices=collect(0:(device_count - 1)),
-                l_tile=3,
-                output=:ring_callback,
-                ring_callback=payload -> Base.lock(delivered_lock) do
-                    delivered[payload.ring] = payload
-                end,
-            ) === nothing
-            @test sort(collect(keys(delivered))) == collect(scanned_rings)
-            for (_, payload) in delivered
-                @test payload.stokes == reference[:, :, :, payload.pixels]
-            end
-
-            # Multi-GPU checkpointing and resume.
-            parallel_path = joinpath(directory, "parallel.ckpt")
-            parallel_checkpointed = convolve_sphere_multigpu(
-                cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                devices=collect(0:(device_count - 1)),
-                l_tile=3,
-                checkpoint_path=parallel_path,
-                checkpoint_id=checkpoint_id,
-                checkpoint_interval=3,
-            )
-            @test parallel_checkpointed[finite] == reference[finite]
-            @test load_sphere_checkpoint(parallel_path, cp).completed ==
-                fill(true, ring_count(cp))
-            skipped = convolve_sphere_multigpu(
-                cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                devices=collect(0:(device_count - 1)),
-                l_tile=3,
-                checkpoint_path=parallel_path,
-                checkpoint_id=checkpoint_id,
-                progress_callback=_ -> error("no ring should be processed"),
-            )
-            @test skipped[finite] == reference[finite]
-
-            @test_throws ArgumentError convolve_sphere_multigpu(
-                cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                devices=Int[],
-            )
-            @test_throws ArgumentError convolve_sphere_multigpu(
-                cp, buffer, prepared_alm, prepared_blm, host_table, plan;
-                devices=[device_count],
-            )
-        finally
-            CUDA.unsafe_free!(alm_gpu.values)
-            CUDA.unsafe_free!(device_table.coefficients)
-            CUDA.unsafe_free!(device_table.pair_lookup)
-            rm(directory; recursive=true, force=true)
-        end
-    end
-end
-
-
-@testset "Binning mapmaker" begin
+@testset "Ring Stokes solve" begin
     cp = ConvolutionParams(
         nside_output=4,
         lstop=5,
@@ -3787,12 +2721,6 @@ end
         numofsky=2,
         numofbeam=2,
     )
-    empty_map = allocate_stokes_map(cp)
-    @test size(empty_map) == (2, 2, 3, cp.resol.numOfPixels)
-    @test all(isnan, empty_map)
-    @test eltype(allocate_stokes_map(cp; precision=Float32)) === Float32
-    @test all(iszero, allocate_stokes_map(cp; unseen=0.0))
-    @test_throws ArgumentError allocate_stokes_map(cp; precision=Int)
 
     if CUDA.functional()
         geometry = ring_geometry(cp, 5)
@@ -3838,53 +2766,31 @@ end
                 stokes,
             )
             try
-                stokes_map = allocate_stokes_map(
-                    cp;
-                    precision=precision,
-                )
-                returned = binning_mapmake!(
-                    stokes_map,
-                    result,
-                    angles,
-                )
-                @test returned === stokes_map
+                solved = ring_stokes(result, angles; precision=precision)
+                @test size(solved) == (2, 2, 3, length(positions))
+                @test eltype(solved) === precision
 
                 tolerance = precision == Float32 ? 2e-5 : 1e-12
-                for (active_index, position) in pairs(positions)
-                    pixel = geometry.first_pixel + position - 1
+                for active_index in eachindex(positions)
                     for beam_index in 1:2, sky_index in 1:2
                         I, Q, U = stokes[
                             sky_index,
                             beam_index,
                             active_index,
                         ]
-                        @test stokes_map[
-                            sky_index, beam_index, 1, pixel,
+                        @test solved[
+                            sky_index, beam_index, 1, active_index,
                         ] ≈ I atol=tolerance rtol=tolerance
-                        @test stokes_map[
-                            sky_index, beam_index, 2, pixel,
+                        @test solved[
+                            sky_index, beam_index, 2, active_index,
                         ] ≈ Q atol=tolerance rtol=tolerance
-                        @test stokes_map[
-                            sky_index, beam_index, 3, pixel,
+                        @test solved[
+                            sky_index, beam_index, 3, active_index,
                         ] ≈ U atol=tolerance rtol=tolerance
                     end
                 end
-
-                # Every pixel the ring did not touch stays unseen.
-                touched = Set(result.pixels)
-                @test all(
-                    isnan,
-                    stokes_map[
-                        :, :, :,
-                        [
-                            pixel
-                            for pixel in 1:cp.resol.numOfPixels
-                            if !(pixel in touched)
-                        ],
-                    ],
-                )
             finally
-                free_ring_convolution!(result)
+                CUDA.unsafe_free!(result.accumulated)
             end
         end
 
@@ -3908,51 +2814,39 @@ end
             stokes,
         )
         try
-            stokes_map = allocate_stokes_map(cp)
-            binning_mapmake!(stokes_map, degenerate, degenerate_angles)
-            bad_pixel = geometry.first_pixel + positions[1] - 1
-            good_pixel = geometry.first_pixel + positions[2] - 1
-            @test all(isnan, stokes_map[:, :, :, bad_pixel])
-            @test all(isfinite, stokes_map[:, :, :, good_pixel])
+            solved = ring_stokes(degenerate, degenerate_angles)
+            @test all(isnan, solved[:, :, :, 1])
+            @test all(isfinite, solved[:, :, :, 2])
+            @test all(iszero, ring_stokes(
+                degenerate,
+                degenerate_angles;
+                unseen=0.0,
+            )[:, :, :, 1])
 
             # rcond=0 disables the rejection.
-            permissive = allocate_stokes_map(cp)
-            binning_mapmake!(
-                permissive,
+            permissive = ring_stokes(
                 degenerate,
                 degenerate_angles;
                 rcond=0.0,
             )
-            @test !all(isnan, permissive[:, :, :, good_pixel])
+            @test !all(isnan, permissive[:, :, :, 2])
 
-            @test_throws DimensionMismatch binning_mapmake!(
-                stokes_map,
+            @test_throws DimensionMismatch ring_stokes(
                 degenerate,
                 degenerate_angles[1:2],
             )
-            @test_throws DimensionMismatch binning_mapmake!(
-                zeros(Float64, 1, 2, 3, cp.resol.numOfPixels),
-                degenerate,
-                degenerate_angles,
-            )
-            @test_throws DimensionMismatch binning_mapmake!(
-                zeros(Float64, 2, 2, 2, cp.resol.numOfPixels),
-                degenerate,
-                degenerate_angles,
-            )
-            @test_throws DimensionMismatch binning_mapmake!(
-                zeros(Float64, 2, 2, 3, 4),
-                degenerate,
-                degenerate_angles,
-            )
-            @test_throws ArgumentError binning_mapmake!(
-                stokes_map,
+            @test_throws ArgumentError ring_stokes(
                 degenerate,
                 degenerate_angles;
                 rcond=-1.0,
             )
+            @test_throws ArgumentError ring_stokes(
+                degenerate,
+                degenerate_angles;
+                precision=Int,
+            )
         finally
-            free_ring_convolution!(degenerate)
+            CUDA.unsafe_free!(degenerate.accumulated)
         end
 
         # The production default rejects a finite but poorly conditioned
@@ -3993,7 +2887,7 @@ end
             @test all(isnan, default_stokes[:, :, :, 1])
             @test all(isfinite, diagnostic_stokes[:, :, :, 1])
         finally
-            free_ring_convolution!(marginal)
+            CUDA.unsafe_free!(marginal.accumulated)
         end
     end
 end
@@ -4087,35 +2981,17 @@ end
         alm_gpu = upload_alm_gpu(prepared_alm)
         result = nothing
         try
-            result = convolve_ring_gpu(
-                cp,
-                geometry,
-                active,
-                angles,
-                alm_gpu,
-                prepared_blm,
-                device_table,
-                plan;
-                l_tile=3,
+            result = _convolve_ring_stages(
+                cp, geometry, active, angles, alm_gpu, prepared_blm,
+                device_table, plan; l_tile=3,
             )
-            stokes_map = allocate_stokes_map(cp)
-            binning_mapmake!(stokes_map, result, angles)
-
-            hit_pixels = result.pixels
-            @test all(isfinite, stokes_map[:, :, :, hit_pixels])
-            @test !any(iszero, stokes_map[:, :, :, hit_pixels])
-            other_pixels = [
-                pixel
-                for pixel in 1:cp.resol.numOfPixels
-                if !(pixel in Set(hit_pixels))
-            ]
-            @test all(isnan, stokes_map[:, :, :, other_pixels])
+            stokes = ring_stokes(result, angles)
+            @test all(isfinite, stokes)
+            @test !any(iszero, stokes)
 
             # Different skies and beams must give different maps.
-            @test stokes_map[1, 1, :, hit_pixels] !=
-                stokes_map[2, 1, :, hit_pixels]
-            @test stokes_map[1, 1, :, hit_pixels] !=
-                stokes_map[1, 2, :, hit_pixels]
+            @test stokes[1, 1, :, :] != stokes[2, 1, :, :]
+            @test stokes[1, 1, :, :] != stokes[1, 2, :, :]
 
             values = Array(result.accumulated)
 
@@ -4133,10 +3009,9 @@ end
             for (active_index, angle) in pairs(angles),
                 beam_index in 1:cp.numofbeam,
                 sky_index in 1:cp.numofsky
-                pixel = hit_pixels[active_index]
-                I = stokes_map[sky_index, beam_index, 1, pixel]
-                Q = stokes_map[sky_index, beam_index, 2, pixel]
-                U = stokes_map[sky_index, beam_index, 3, pixel]
+                I = stokes[sky_index, beam_index, 1, active_index]
+                Q = stokes[sky_index, beam_index, 2, active_index]
+                U = stokes[sky_index, beam_index, 3, active_index]
                 signal = [
                     _ideal_signal(I, Q, U, psi)
                     for psi in angle.ψ
@@ -4152,8 +3027,8 @@ end
                 ] atol=1e-9 rtol=1e-9
             end
         finally
-            result === nothing || free_ring_convolution!(result)
-            Scanvolver._free_active_ring_pixels!(active)
+            result === nothing || CUDA.unsafe_free!(result.accumulated)
+            CUDA.unsafe_free!(active.positions)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -4283,16 +3158,9 @@ _legacy_packed_index(l, m, lmax) =
         alm_gpu = upload_alm_gpu(prepared_alm)
         result = nothing
         try
-            result = convolve_ring_gpu(
-                cp,
-                geometry,
-                active,
-                angles,
-                alm_gpu,
-                prepared_blm,
-                device_table,
-                plan;
-                l_tile=4,
+            result = _convolve_ring_stages(
+                cp, geometry, active, angles, alm_gpu, prepared_blm,
+                device_table, plan; l_tile=4,
             )
             values = Array(result.accumulated)
             @test all(isfinite, values)
@@ -4304,27 +3172,20 @@ _legacy_packed_index(l, m, lmax) =
             @test maximum(abs, imag.(values[:, :, :, 1])) <
                 1e-12 * maximum(abs, real.(values[:, :, :, 1]))
 
-            stokes_map = allocate_stokes_map(cp)
-            binning_mapmake!(stokes_map, result, angles)
-            @test all(isfinite, stokes_map[:, :, :, result.pixels])
-            @test !any(iszero, stokes_map[:, :, :, result.pixels])
-            other_pixels = [
-                pixel
-                for pixel in 1:cp.resol.numOfPixels
-                if !(pixel in Set(result.pixels))
-            ]
-            @test all(isnan, stokes_map[:, :, :, other_pixels])
+            stokes = ring_stokes(result, angles)
+            @test all(isfinite, stokes)
+            @test !any(iszero, stokes)
 
             # A CMB sky is intensity dominated: r=0 gives no primordial B and
             # E is far below T, so the recovered I must dominate Q and U.
-            recovered_I = abs.(stokes_map[1, 1, 1, result.pixels])
-            recovered_Q = abs.(stokes_map[1, 1, 2, result.pixels])
-            recovered_U = abs.(stokes_map[1, 1, 3, result.pixels])
+            recovered_I = abs.(stokes[1, 1, 1, :])
+            recovered_Q = abs.(stokes[1, 1, 2, :])
+            recovered_U = abs.(stokes[1, 1, 3, :])
             @test maximum(recovered_I) > 10 * maximum(recovered_Q)
             @test maximum(recovered_I) > 10 * maximum(recovered_U)
         finally
-            result === nothing || free_ring_convolution!(result)
-            Scanvolver._free_active_ring_pixels!(active)
+            result === nothing || CUDA.unsafe_free!(result.accumulated)
+            CUDA.unsafe_free!(active.positions)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -4383,27 +3244,20 @@ function _convolve_pixel_centre_ring(cp, ring, raw_alm, raw_blm; l_tile=4)
     )
     alm_gpu = upload_alm_gpu(prepare_alm(cp, raw_alm; precision=Float64))
     prepared_blm = prepare_blm(cp, raw_blm; precision=Float64)
-    result = convolve_ring_gpu(
-        cp,
-        geometry,
-        active,
-        angles,
-        alm_gpu,
-        prepared_blm,
-        device_table,
-        plan;
+    result = _convolve_ring_stages(
+        cp, geometry, active, angles, alm_gpu, prepared_blm, device_table, plan;
         l_tile=l_tile,
     )
-    stokes_map = allocate_stokes_map(cp)
-    binning_mapmake!(stokes_map, result, angles)
+    # Every pixel of the ring is hit, so the ring-local order is pixel order.
+    stokes = ring_stokes(result, angles)
     pixels = copy(result.pixels)
     maximum_beta = maximum(maximum(angle.β) for angle in angles)
-    free_ring_convolution!(result)
-    Scanvolver._free_active_ring_pixels!(active)
+    CUDA.unsafe_free!(result.accumulated)
+    CUDA.unsafe_free!(active.positions)
     CUDA.unsafe_free!(alm_gpu.values)
     CUDA.unsafe_free!(device_table.coefficients)
     CUDA.unsafe_free!(device_table.pair_lookup)
-    return stokes_map, pixels, maximum_beta
+    return stokes, pixels, maximum_beta
 end
 
 """Largest |m| > lstop Fourier amplitude of a ring, and the largest in-band one.
@@ -4457,7 +3311,7 @@ end
             value = mode_m == 0 ? ComplexF64(1.0) : ComplexF64(0.6, 0.8)
             sky[1, _legacy_packed_index(mode_l, mode_m, lmax)] = value
 
-            stokes_map, pixels, maximum_beta =
+            stokes, pixels, maximum_beta =
                 _convolve_pixel_centre_ring(cp, 16, sky, unit_beam)
             @test maximum_beta == 0.0
 
@@ -4466,7 +3320,7 @@ end
             reference_alm.alm[almIndex(reference_alm, mode_l, mode_m)] = value
             reference = alm2map(reference_alm, cp.nside_output)
 
-            transfer = stokes_map[1, 1, 1, pixels] ./
+            transfer = stokes[1, 1, 1, :] ./
                 reference.pixels[pixels]
             expected = sqrt(4pi / (2 * mode_l + 1))
             @test maximum(abs, transfer .- expected) < 1e-11 * expected
@@ -4492,7 +3346,7 @@ end
         # Ring 16 is the case that used to fail: its colatitude makes the
         # residual R[3,3] land one ulp below 1.
         for ring in (15, 16, 24)
-            stokes_map, pixels, maximum_beta =
+            stokes, pixels, maximum_beta =
                 _convolve_pixel_centre_ring(cp, ring, sky, beam)
             @test maximum_beta == 0.0
 
@@ -4515,9 +3369,9 @@ end
                 cp.nside_output,
             )
 
-            recovered_i = stokes_map[1, 1, 1, pixels]
-            recovered_q = stokes_map[1, 1, 2, pixels]
-            recovered_u = stokes_map[1, 1, 3, pixels]
+            recovered_i = stokes[1, 1, 1, :]
+            recovered_q = stokes[1, 1, 2, :]
+            recovered_u = stokes[1, 1, 3, :]
             reference_i = reference.i.pixels[pixels]
             # This beam has b_B = i*b_E, hence b_{+2} = 0 and b_{-2} = -2*b_E,
             # so using b_E as the polarized window is short by exactly -2.
@@ -4656,7 +3510,7 @@ end
 
     if CUDA.functional()
         beta = 0.731
-        ringd_device = CUDA.@sync ringd_blocks_recursion_gpu(
+        ringd_device = CUDA.@sync _ringd_gpu(
             cp,
             beta,
         )
@@ -4694,7 +3548,7 @@ end
             end
         end
 
-        identity_ringd_device = CUDA.@sync ringd_blocks_recursion_gpu(cp, 0.0)
+        identity_ringd_device = CUDA.@sync _ringd_gpu(cp, 0.0)
         identity_ringd = Array(identity_ringd_device)
         for l in 0:cp.lstop
             count = 2l + 1
@@ -4710,7 +3564,7 @@ end
             end
         end
 
-        ringd32_device = CUDA.@sync ringd_blocks_recursion_gpu(
+        ringd32_device = CUDA.@sync _ringd_gpu(
             cp,
             beta;
             precision=Float32,
@@ -4718,13 +3572,13 @@ end
         @test eltype(ringd32_device) == ComplexF32
         @test Array(ringd32_device) ≈
             ringd atol=8e-5 rtol=8e-5
-        @test_throws ArgumentError ringd_blocks_recursion_gpu(
+        @test_throws ArgumentError _ringd_gpu(
             cp,
             beta;
             precision=Float16,
         )
     else
-        @test_throws ArgumentError ringd_blocks_recursion_gpu(
+        @test_throws ArgumentError _ringd_gpu(
             cp,
             0.731,
         )

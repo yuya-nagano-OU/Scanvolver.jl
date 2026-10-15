@@ -4,7 +4,7 @@
         precision=Float64, complete_ring=false,
     ) -> NamedTuple
 
-Device bytes that one ring of `convolve_ring_gpu` needs, split into the parts
+Device bytes that one ring of the convolution needs, split into the parts
 that live for the whole ring and the parts that live for one `l` tile.
 
 Fields: `ringd_plan`, `ringd`, `accumulated`, `persistent`;
@@ -134,86 +134,4 @@ function max_indexable_l_tile(
     )
     per_tile == 0 && return cp.lstop - cp.lstart + 1
     return Int(min(Int128(cp.lstop - cp.lstart + 1), limit ÷ per_tile))
-end
-
-function _available_device_bytes()
-    return min(
-        Int128(CUDA.total_memory()),
-        Int128(CUDA.free_memory()) + Int128(CUDA.cached_memory()),
-    )
-end
-
-"""
-    suggest_l_tile(
-        cp, ring_pixel_count, active_count;
-        precision=Float64, complete_ring=false, max_tile=nothing,
-        memory_fraction=0.8, available_bytes=nothing, reserve_bytes=0,
-        subtract_persistent=true,
-    ) -> Int
-
-Largest `l` tile that both indexes with `Int32` and whose tile peak fits the
-budget, at least 1.
-
-The budget is `memory_fraction` of the currently available device memory less
-`reserve_bytes`, which is where a caller passes what it has already committed,
-typically the scan moments. Persistent per-ring allocations are subtracted first, since they are live
-before any tile is built. Pass `subtract_persistent=false` when they are
-already allocated, so that the measured free memory reflects them and they are
-not counted twice.
-
-Returning 1 does not promise that one `l` fits: it is the floor. Compare
-`ring_memory_bytes(...; l_tile=1).total` against the budget when that matters.
-"""
-function suggest_l_tile(
-    cp::ConvolutionParams,
-    ring_pixel_count::Integer,
-    active_count::Integer;
-    precision::Type=Float64,
-    complete_ring::Bool=false,
-    max_tile::Union{Nothing,Integer}=nothing,
-    memory_fraction::Real=0.8,
-    available_bytes::Union{Nothing,Integer}=nothing,
-    reserve_bytes::Integer=0,
-    subtract_persistent::Bool=true,
-)
-    isfinite(memory_fraction) && 0 < memory_fraction <= 1 ||
-        throw(ArgumentError(
-            "memory_fraction must be in (0, 1], got $memory_fraction",
-        ))
-    reserve_bytes >= 0 || throw(ArgumentError(
-        "reserve_bytes must be non-negative, got $reserve_bytes",
-    ))
-
-    full_range = cp.lstop - cp.lstart + 1
-    ceiling = max_tile === nothing ? full_range : Int(max_tile)
-    ceiling >= 1 || throw(ArgumentError(
-        "max_tile must be positive, got $ceiling",
-    ))
-    ceiling = min(ceiling, full_range, max_indexable_l_tile(cp, active_count))
-    ceiling <= 1 && return max(1, ceiling)
-
-    total_available = available_bytes === nothing ?
-        _available_device_bytes() :
-        Int128(available_bytes)
-    budget = floor(
-        Int128,
-        Float64(memory_fraction) * Float64(total_available),
-    ) - Int128(reserve_bytes)
-
-    unit = ring_memory_bytes(
-        cp,
-        ring_pixel_count,
-        active_count,
-        1;
-        precision=precision,
-        complete_ring=complete_ring,
-    )
-    tile_budget = subtract_persistent ? budget - unit.persistent : budget
-    tile_budget <= 0 && return 1
-
-    # tile_peak is exactly linear in the tile width, so one evaluation sets
-    # the slope.
-    unit_peak = unit.tile_peak
-    unit_peak <= 0 && return ceiling
-    return Int(max(Int128(1), min(Int128(ceiling), tile_budget ÷ unit_peak)))
 end

@@ -3,6 +3,7 @@ using HDF5: attributes
 using NPZ
 include(joinpath(@__DIR__, "..", "beam_batched_pipeline.jl"))
 using .BeamBatchedHDF5
+include(joinpath(@__DIR__, "..", "..", "..", "test", "cpu_reference.jl"))
 
 # Declared before evaluating any new-pipeline result. These are pointwise
 # tolerances on normalized test signals, not fitted to measured differences.
@@ -63,22 +64,36 @@ function fixture(; nside=8, lmax=12, bnmax=4, kappa=3)
     return cp, alms, blms, build_ring_scan_buffer(cp, phi, theta, psi), rejected_pixel
 end
 
+# The reference map: every ring through the CPU reference of each stage (scan
+# moments, sky ring, effective beam, contraction), then the per-pixel solve the
+# pipeline also uses. Shared with the pipeline: the CPU-built Wigner table, the
+# GPU ringD recursion and ring_stokes, each tested on its own in test/runtests.jl.
 function baseline(cp, buffer, alm, blm, T; tile=4)
     CUDA.device!(0)
     plan = automatic_scan_plan(cp; precision=T)
-    table = upload_wigner_table_gpu(build_wigner_chebyshev_table_cpu(cp, plan))
-    gpu_alm = nothing
+    table = build_wigner_chebyshev_table_cpu(cp, plan)
+    reference = fill(T(NaN), cp.numofsky, cp.numofbeam, 3, cp.resol.numOfPixels)
+    context = ringd_context(cp; precision=T)
     try
-        gpu_alm = upload_alm_gpu(alm)
-        return convolve_sphere_gpu(cp, buffer, gpu_alm, blm, table, plan;
-                                   l_tile=tile, map_precision=T, rcond=1e-2,
-                                   moment_method=:gemm)
+        for ring in buffer.first_ring:buffer.last_ring
+            geometry = ring_geometry(cp, ring)
+            active, angles = make_ring_angles(cp, geometry, buffer)
+            active === nothing && continue
+            positions = Int.(Array(active.positions))
+            CUDA.unsafe_free!(active.positions)
+            ringd = Array(ringd_blocks_recursion_gpu!(context, cp, geometry.theta))
+            accumulated = _ring_convolution_cpu_reference(
+                cp, geometry, positions, angles, table, alm, blm, ringd, plan, tile)
+            pixels = geometry.first_pixel .+ positions .- 1
+            result = RingConvolution{T}(ring, geometry.first_pixel, geometry.pixel_count,
+                                        positions, pixels, CuArray(accumulated))
+            reference[:, :, :, pixels] = ring_stokes(result, angles; rcond=1e-2, precision=T)
+            CUDA.unsafe_free!(result.accumulated)
+        end
     finally
-        gpu_alm === nothing || CUDA.unsafe_free!(gpu_alm.values)
-        CUDA.unsafe_free!(table.coefficients)
-        CUDA.unsafe_free!(table.pair_lookup)
-        CUDA.reclaim()
+        free_ringd_context!(context)
     end
+    return reference
 end
 
 function compare_maps(reference, actual, T, label)

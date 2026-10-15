@@ -309,47 +309,16 @@ function _compute_ringd_recursion_gpu!(
 end
 
 """
-    ringd_blocks_recursion_gpu(
-        cp, beta; device_id=nothing, precision=Float64,
-    )
-
-Compute the complete ringD stack on the selected CUDA device. The padded
-CuArray has layout (m, M, l) and shape
-(2lstop+1, 2Mmax(lstop)+1, length(lstart:lstop)).
-"""
-function ringd_blocks_recursion_gpu(
-    cp,
-    beta::Real;
-    device_id::Union{Nothing,Integer}=nothing,
-    precision::Type=Float64,
-)
-    CUDA.functional() || throw(ArgumentError(
-        "CUDA.jl is loaded but no functional GPU is available",
-    ))
-    device_id === nothing || CUDA.device!(Int(device_id))
-    T = _check_gpu_recursion_precision(precision)
-    plan = _build_ring_gpu_plan(cp, T)
-    ringd = CUDA.zeros(
-        Complex{T},
-        2 * cp.lstop + 1,
-        2 * calc_Mmax(cp, cp.lstop) + 1,
-        cp.lstop - cp.lstart + 1,
-    )
-    return _compute_ringd_recursion_gpu!(ringd, plan, cp, beta)
-end
-
-"""
     RingDContext{T}
 
 The reusable half of the ringD computation: the seed plan and the output
 buffer.
 
-`ringd_blocks_recursion_gpu` builds both on every call. The seed plan is one
-entry per `(m, M)` pair, which is about 627k pairs at lmax 1200 and Mmax 130,
-each assembled on the host and uploaded; the buffer is 5.6 GB at that size in
-Float32. Neither depends on the ring, only on `lstart`, `lstop`, `Mmax` and the
-precision, so a full sphere should build them once and refill the buffer per
-ring.
+Both are expensive to build. The seed plan is one entry per `(m, M)` pair,
+which is about 627k pairs at lmax 1200 and Mmax 130, each assembled on the host
+and uploaded; the buffer is 5.6 GB at that size in Float32. Neither depends on
+the ring, only on `lstart`, `lstop`, `Mmax` and the precision, so a full sphere
+builds them once and `ringd_blocks_recursion_gpu!` refills the buffer per ring.
 """
 struct RingDContext{T<:_GPU_RECURSION_PRECISIONS}
     plan::_RingRecursionGPUPlan{T}

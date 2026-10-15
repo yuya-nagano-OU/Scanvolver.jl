@@ -79,7 +79,7 @@ C_{i,j,p,w}\\mathrel{+}=\\sum_\\mu U_{i,\\mu,p}E_{\\mu,j,p,w}.
 Layouts:
 
 - `sky_ring[sky, term, pixel]` — from `build_sky_ring_gpu`
-- `effective_beam[term, beam, pixel, scan_weight]` — from `build_effective_beam_gpu`
+- `effective_beam[term, beam, pixel, scan_weight]` — from `apply_beams_gemm_gpu`
 - `accumulated[sky, beam, pixel, scan_weight]` — allocated by the caller
 
 `term` is the flattened `(spin, M, l)` index shared by both inputs: spin varies

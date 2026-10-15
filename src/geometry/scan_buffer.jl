@@ -285,8 +285,8 @@ end
     make_ring_angles(cp, geometry, buffer) -> (active, angles)
 
 Read one ring out of a pixel-ordered scan buffer. Returns exactly what the
-time-stream method returns, in the same ascending order, so it drops straight
-into `convolve_ring_gpu`: `(nothing, Angles[])` for a ring with no hits.
+time-stream method returns, in the same ascending order, so either can feed
+the ring convolution: `(nothing, Angles[])` for a ring with no hits.
 
 Samples within a pixel come out in the buffer's order rather than in time
 order, which changes nothing downstream but does reorder the floating-point
