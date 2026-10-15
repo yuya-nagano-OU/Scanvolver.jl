@@ -1,8 +1,8 @@
-# EBCoDeCMB.jl
+# Scanvolver.jl
 
-[![CI](https://github.com/yuya-nagano-OU/EBCoDeCMB.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/yuya-nagano-OU/EBCoDeCMB.jl/actions/workflows/CI.yml)
+[![CI](https://github.com/yuya-nagano-OU/Scanvolver.jl/actions/workflows/CI.yml/badge.svg?branch=main)](https://github.com/yuya-nagano-OU/Scanvolver.jl/actions/workflows/CI.yml)
 
-EBCoDeCMB.jl is a Julia package for GPU-accelerated, scan-aware beam
+Scanvolver.jl is a Julia package for GPU-accelerated, scan-aware beam
 convolution in cosmic microwave background (CMB) sky simulations. It builds
 reusable scan-dependent effective kernels and applies them across many sky and
 beam realizations without constructing prohibitively large full-sky
@@ -23,19 +23,19 @@ convolution drivers require `CUDA.functional() == true`.
 
 ## Installation
 
-EBCoDeCMB.jl is not registered in Julia's General registry. Install it directly
+Scanvolver.jl is not registered in Julia's General registry. Install it directly
 from GitHub:
 
 ```julia
 using Pkg
-Pkg.add(url="https://github.com/yuya-nagano-OU/EBCoDeCMB.jl")
+Pkg.add(url="https://github.com/yuya-nagano-OU/Scanvolver.jl")
 ```
 
 For development, clone the repository and activate it:
 
 ```julia
 using Pkg
-Pkg.activate("path/to/EBCoDeCMB.jl")
+Pkg.activate("path/to/Scanvolver.jl")
 Pkg.instantiate()
 ```
 
@@ -46,7 +46,7 @@ prepares one sky and one beam from HEALPix/healpy packed non-negative-mode
 coefficients. The three rows are interpreted as `(T, E, B)`.
 
 ```julia
-using EBCoDeCMB
+using Scanvolver
 
 lmax = 8
 ncoeff = (lmax + 1) * (lmax + 2) ÷ 2
@@ -72,7 +72,7 @@ prepared_blm = prepare_blm(cp, blm_teb)
 The full GPU pipeline additionally builds a scan buffer, Wigner--Chebyshev
 table, and scan-moment plan before calling `convolve_sphere_gpu` or
 `convolve_sphere_multigpu`. See [`notebook/README.md`](notebook/README.md) for
-the available validation notebooks and the full-pipeline research example.
+the validation notebooks.
 
 ## Current scope
 
@@ -114,4 +114,4 @@ not the GPU kernels.
 
 ## License
 
-EBCoDeCMB.jl is released under the MIT License. See [`LICENSE`](LICENSE).
+Scanvolver.jl is released under the MIT License. See [`LICENSE`](LICENSE).

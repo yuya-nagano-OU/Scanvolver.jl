@@ -1,4 +1,4 @@
-module EBCoDeCMB
+module Scanvolver
 
 using CUDA
 using Healpix: Resolution, pix2angRing, ang2pixRing, getringinfo,

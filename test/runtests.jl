@@ -1,4 +1,4 @@
-using EBCoDeCMB
+using Scanvolver
 using CUDA
 using Healpix: Alm, almIndex, alm2map, numberOfAlms
 using LinearAlgebra: cond
@@ -322,7 +322,7 @@ end
 end
 
 @testset "ringD seed plan" begin
-    seed = EBCoDeCMB._precompute_wignerd_lmin_seed_plan(
+    seed = Scanvolver._precompute_wignerd_lmin_seed_plan(
         0,
         0,
         0,
@@ -332,7 +332,7 @@ end
     @test seed.pow_c == 0
     @test seed.pow_s == 0
 
-    @test_throws ArgumentError EBCoDeCMB._precompute_wignerd_lmin_seed_plan(2, 0, 0)
+    @test_throws ArgumentError Scanvolver._precompute_wignerd_lmin_seed_plan(2, 0, 0)
 end
 
 @testset "Chebyshev" begin
@@ -359,26 +359,26 @@ end
     @test all(0 .< nodes .< plan.beta_max)
 
     values = zeros(Float64, plan.beta_order)
-    returned = EBCoDeCMB._chebyshev_values!(values, plan, 1.2)
+    returned = Scanvolver._chebyshev_values!(values, plan, 1.2)
     x = 0.2
     @test returned === values
     @test values ≈ [1.0, x, 2x^2 - 1, 4x^3 - 3x]
-    @test EBCoDeCMB._scaled_beta(plan, 0.0) == -1.0
-    @test EBCoDeCMB._scaled_beta(plan, plan.beta_max) == 1.0
-    @test_throws DomainError EBCoDeCMB._scaled_beta(plan, -0.1)
-    @test_throws DomainError EBCoDeCMB._scaled_beta(plan, 2.1)
-    @test_throws DimensionMismatch EBCoDeCMB._chebyshev_values!(
+    @test Scanvolver._scaled_beta(plan, 0.0) == -1.0
+    @test Scanvolver._scaled_beta(plan, plan.beta_max) == 1.0
+    @test_throws DomainError Scanvolver._scaled_beta(plan, -0.1)
+    @test_throws DomainError Scanvolver._scaled_beta(plan, 2.1)
+    @test_throws DimensionMismatch Scanvolver._chebyshev_values!(
         zeros(Float64, 3),
         plan,
         1.0,
     )
 
-    transform = EBCoDeCMB._chebyshev_transform(plan)
+    transform = Scanvolver._chebyshev_transform(plan)
     coefficients = [3.0, 2.0, -0.5, 0.25]
     node_values = similar(nodes)
     workspace = similar(nodes)
     for node_index in eachindex(nodes)
-        EBCoDeCMB._chebyshev_values!(
+        Scanvolver._chebyshev_values!(
             workspace,
             plan,
             nodes[node_index],
@@ -394,7 +394,7 @@ end
         beta_max=0.5,
     )
     single_values = zeros(Float32, 1)
-    @test EBCoDeCMB._chebyshev_values!(
+    @test Scanvolver._chebyshev_values!(
         single_values,
         single,
         0.25,
@@ -445,7 +445,7 @@ function _synthetic_scan_moment_angles(
     pixel::Int=1,
     hit_count::Int=11,
 )
-    theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(
+    theta_pixel, phi_pixel = Scanvolver.pix2angRing(
         cp.resol,
         pixel,
     )
@@ -1195,7 +1195,7 @@ end
 
         # One colatitude per ring: a single ringD stack serves the ring.
         for pixel in first_pixel:last_pixel
-            theta, phi = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+            theta, phi = Scanvolver.pix2angRing(cp.resol, pixel)
             @test theta ≈ geometry.theta atol=1e-12
             @test geometry.phi_pixels[pixel - first_pixel + 1] ≈
                 phi atol=1e-12
@@ -1203,7 +1203,7 @@ end
 
         # Ascending, and accepted by the sky-ring FFT validator.
         @test issorted(geometry.phi_pixels)
-        @test EBCoDeCMB._check_ring_longitudes(geometry.phi_pixels) ≈
+        @test Scanvolver._check_ring_longitudes(geometry.phi_pixels) ≈
             geometry.phi_pixels[1]
     end
     @test occursin("ring=8", sprint(show, ring_geometry(cp, 8)))
@@ -1219,7 +1219,7 @@ end
     time_tod = Float64[]
     for position in hit_positions, hit in 1:hits_per_pixel
         pixel = geometry.first_pixel + position - 1
-        theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+        theta_pixel, phi_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
         push!(theta_tod, theta_pixel + 1e-4 * sin(hit))
         push!(phi_tod, phi_pixel + 1e-4 * cos(hit))
         push!(psi_tod, mod(0.3 + 0.7 * hit + position, 2pi))
@@ -1227,7 +1227,7 @@ end
     end
     # Samples belonging to a different ring must be ignored.
     other = ring_geometry(cp, ring + 2)
-    other_theta, other_phi = EBCoDeCMB.pix2angRing(
+    other_theta, other_phi = Scanvolver.pix2angRing(
         cp.resol,
         other.first_pixel,
     )
@@ -1255,7 +1255,7 @@ end
             # what aligns the gathered sky ring with the effective beam.
             for (active_index, position) in pairs(hit_positions)
                 pixel = geometry.first_pixel + position - 1
-                theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(
+                theta_pixel, phi_pixel = Scanvolver.pix2angRing(
                     cp.resol,
                     pixel,
                 )
@@ -1267,7 +1267,7 @@ end
             @test sum(angle.num for angle in angles) ==
                 length(hit_positions) * hits_per_pixel
         finally
-            EBCoDeCMB._free_active_ring_pixels!(active)
+            Scanvolver._free_active_ring_pixels!(active)
         end
 
         # A ring with no hits.
@@ -1288,7 +1288,7 @@ end
         full_psi = Float64[]
         for position in 1:full_geometry.pixel_count
             pixel = full_geometry.first_pixel + position - 1
-            theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(
+            theta_pixel, phi_pixel = Scanvolver.pix2angRing(
                 cp.resol,
                 pixel,
             )
@@ -1307,7 +1307,7 @@ end
             @test full_active.complete == true
             @test length(full_angles) == full_geometry.pixel_count
         finally
-            EBCoDeCMB._free_active_ring_pixels!(full_active)
+            Scanvolver._free_active_ring_pixels!(full_active)
         end
     end
 
@@ -1346,7 +1346,7 @@ function _multi_ring_tod(cp, rings, positions_per_ring, hits)
         for position in positions_per_ring
             position <= geometry.pixel_count || continue
             pixel = geometry.first_pixel + position - 1
-            theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+            theta_pixel, phi_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
             push!(theta, theta_pixel + 2.0e-4 * sin(0.7 * hit + position))
             push!(phi, phi_pixel + 2.0e-4 * cos(0.9 * hit - position))
             push!(psi, mod(0.23 + 1.3 * hit + 0.5 * position, 2pi))
@@ -1393,7 +1393,7 @@ end
             pixel = buffer.first_pixel + bucket - 1
             for sample in
                 buffer.pixel_offsets[bucket]:(buffer.pixel_offsets[bucket + 1] - 1)
-                @test EBCoDeCMB.ang2pixRing(
+                @test Scanvolver.ang2pixRing(
                     cp.resol,
                     buffer.theta[sample],
                     buffer.phi[sample],
@@ -1437,8 +1437,8 @@ end
                 @test ring_hit_count(buffer, ring) ==
                     sum(angle.num for angle in direct_angles)
             finally
-                EBCoDeCMB._free_active_ring_pixels!(direct_active)
-                EBCoDeCMB._free_active_ring_pixels!(buffered_active)
+                Scanvolver._free_active_ring_pixels!(direct_active)
+                Scanvolver._free_active_ring_pixels!(buffered_active)
             end
         end
 
@@ -1486,8 +1486,8 @@ end
                         _angle_samples(angles2[index])
                 end
             finally
-                EBCoDeCMB._free_active_ring_pixels!(a1)
-                EBCoDeCMB._free_active_ring_pixels!(a2)
+                Scanvolver._free_active_ring_pixels!(a1)
+                Scanvolver._free_active_ring_pixels!(a2)
             end
         end
 
@@ -1620,8 +1620,8 @@ end
                 free_ring_convolution!(direct_result)
             buffered_result === nothing ||
                 free_ring_convolution!(buffered_result)
-            EBCoDeCMB._free_active_ring_pixels!(direct_active)
-            EBCoDeCMB._free_active_ring_pixels!(buffered_active)
+            Scanvolver._free_active_ring_pixels!(direct_active)
+            Scanvolver._free_active_ring_pixels!(buffered_active)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -1747,8 +1747,8 @@ end
                 end
             end
         finally
-            EBCoDeCMB._free_active_ring_pixels!(partial)
-            EBCoDeCMB._free_active_ring_pixels!(complete)
+            Scanvolver._free_active_ring_pixels!(partial)
+            Scanvolver._free_active_ring_pixels!(complete)
         end
     else
         @test_throws ArgumentError ActiveRingPixels([1, 2], 4)
@@ -2407,7 +2407,7 @@ end
                 effective === nothing || CUDA.unsafe_free!(effective)
                 accumulated === nothing ||
                     CUDA.unsafe_free!(accumulated)
-                EBCoDeCMB._free_active_ring_pixels!(active)
+                Scanvolver._free_active_ring_pixels!(active)
                 CUDA.unsafe_free!(ringd)
                 CUDA.unsafe_free!(moments_device)
                 CUDA.unsafe_free!(alm_gpu.values)
@@ -2425,7 +2425,7 @@ function _ring_scan_tod(cp, geometry, positions, hits_per_pixel)
     psi = Float64[]
     for position in positions, hit in 1:hits_per_pixel
         pixel = geometry.first_pixel + position - 1
-        theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+        theta_pixel, phi_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
         push!(theta, theta_pixel + 2.0e-4 * sin(0.7 * hit + position))
         push!(phi, phi_pixel + 2.0e-4 * cos(0.9 * hit - position))
         push!(psi, mod(0.23 + 1.3 * hit + 0.5 * position, 2pi))
@@ -2699,7 +2699,7 @@ end
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
-            EBCoDeCMB._free_active_ring_pixels!(active)
+            Scanvolver._free_active_ring_pixels!(active)
         end
     end
 end
@@ -2904,7 +2904,7 @@ end
             free_ringd_context!(context)
             for (active, _) in prepared
                 active === nothing ||
-                    EBCoDeCMB._free_active_ring_pixels!(active)
+                    Scanvolver._free_active_ring_pixels!(active)
             end
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
@@ -3106,7 +3106,7 @@ end
                     end
                     convenience === nothing ||
                         free_ring_convolution!(convenience)
-                    EBCoDeCMB._free_active_ring_pixels!(active)
+                    Scanvolver._free_active_ring_pixels!(active)
                     CUDA.unsafe_free!(alm_gpu.values)
                     CUDA.unsafe_free!(device_table.coefficients)
                     CUDA.unsafe_free!(device_table.pair_lookup)
@@ -3210,7 +3210,7 @@ end
                 prepared_blm, device_table, plan,
             ) === nothing
         finally
-            EBCoDeCMB._free_active_ring_pixels!(active)
+            Scanvolver._free_active_ring_pixels!(active)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -3220,7 +3220,7 @@ end
 
 
 function _angles_with_psi(cp, pixel, psi)
-    theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+    theta_pixel, phi_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
     hit_count = length(psi)
     return Angles(
         cp;
@@ -3322,7 +3322,7 @@ end
             maximum(angle.β)
             for angle in probe_angles
         )
-        EBCoDeCMB._free_active_ring_pixels!(probe_active)
+        Scanvolver._free_active_ring_pixels!(probe_active)
         plan = ScanMomentPlan(
             kappa=cp.κ,
             nmax=calc_nmax(cp, cp.lstop),
@@ -3354,7 +3354,7 @@ end
                     append!(reference_pixels, result.pixels)
                 finally
                     result === nothing || free_ring_convolution!(result)
-                    EBCoDeCMB._free_active_ring_pixels!(active)
+                    Scanvolver._free_active_ring_pixels!(active)
                 end
             end
 
@@ -3504,7 +3504,7 @@ end
     worker_finished = Threads.Atomic{Int}(0)
     worker_error = nothing
     try
-        EBCoDeCMB._run_sphere_workers((:fail, :finish)) do action
+        Scanvolver._run_sphere_workers((:fail, :finish)) do action
             if action === :fail
                 error("simulated worker failure")
             end
@@ -3553,7 +3553,7 @@ end
             maximum(angle.β)
             for angle in probe_angles
         )
-        EBCoDeCMB._free_active_ring_pixels!(probe_active)
+        Scanvolver._free_active_ring_pixels!(probe_active)
         plan = ScanMomentPlan(
             kappa=cp.κ,
             nmax=calc_nmax(cp, cp.lstop),
@@ -4153,7 +4153,7 @@ end
             end
         finally
             result === nothing || free_ring_convolution!(result)
-            EBCoDeCMB._free_active_ring_pixels!(active)
+            Scanvolver._free_active_ring_pixels!(active)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -4324,7 +4324,7 @@ _legacy_packed_index(l, m, lmax) =
             @test maximum(recovered_I) > 10 * maximum(recovered_U)
         finally
             result === nothing || free_ring_convolution!(result)
-            EBCoDeCMB._free_active_ring_pixels!(active)
+            Scanvolver._free_active_ring_pixels!(active)
             CUDA.unsafe_free!(alm_gpu.values)
             CUDA.unsafe_free!(device_table.coefficients)
             CUDA.unsafe_free!(device_table.pair_lookup)
@@ -4358,7 +4358,7 @@ function _pixel_centre_ring_scan(cp, geometry, positions; hits=8)
     psi = Float64[]
     for position in positions, hit in 1:hits
         pixel = geometry.first_pixel + position - 1
-        theta_pixel, phi_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+        theta_pixel, phi_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
         push!(theta, theta_pixel)
         push!(phi, phi_pixel)
         push!(psi, pi * (hit - 1) / hits)
@@ -4399,7 +4399,7 @@ function _convolve_pixel_centre_ring(cp, ring, raw_alm, raw_blm; l_tile=4)
     pixels = copy(result.pixels)
     maximum_beta = maximum(maximum(angle.β) for angle in angles)
     free_ring_convolution!(result)
-    EBCoDeCMB._free_active_ring_pixels!(active)
+    Scanvolver._free_active_ring_pixels!(active)
     CUDA.unsafe_free!(alm_gpu.values)
     CUDA.unsafe_free!(device_table.coefficients)
     CUDA.unsafe_free!(device_table.pair_lookup)
@@ -4588,7 +4588,7 @@ end
 
     beta = 0.37
     basis = zeros(Float64, plan.beta_order)
-    EBCoDeCMB._chebyshev_values!(basis, plan, beta)
+    Scanvolver._chebyshev_values!(basis, plan, beta)
     pair_index = findfirst(eachindex(table.pair_M)) do index
         table.pair_M[index] == 1 && table.pair_n[index] == 0
     end
@@ -4754,7 +4754,7 @@ end
         # the GPU ringD recursion: two independent recurrence codes.
         beta = 0.37
         chebyshev = zeros(Float64, plan.beta_order)
-        EBCoDeCMB._chebyshev_values!(chebyshev, plan, beta)
+        Scanvolver._chebyshev_values!(chebyshev, plan, beta)
         context = ringd_context(cp; precision=Float64)
         ringd = Array(CUDA.@sync ringd_blocks_recursion_gpu!(context, cp, beta))
         free_ringd_context!(context)
@@ -4810,8 +4810,8 @@ end
 end
 
 @testset "Euler ZYZ degeneracy" begin
-    wrap = EBCoDeCMB.wrap_pm_pi
-    rebuild(α, β, γ) = Matrix(EBCoDeCMB.Rzyz(α, β, γ))
+    wrap = Scanvolver.wrap_pm_pi
+    rebuild(α, β, γ) = Matrix(Scanvolver.Rzyz(α, β, γ))
 
     # The defining property: the extracted angles must rebuild the rotation.
     # This is what a degenerate beta used to break.
@@ -4822,8 +4822,8 @@ end
         (0.1, pi - 1e-3, -0.5),
         (-0.8, 1e-9, 1.1),
     )
-        R = Matrix(EBCoDeCMB.Rzyz(a, b, c))
-        α, β, γ = EBCoDeCMB.euler_zyz_from_R(R)
+        R = Matrix(Scanvolver.Rzyz(a, b, c))
+        α, β, γ = Scanvolver.euler_zyz_from_R(R)
         @test rebuild(α, β, γ) ≈ R atol=1e-14
         @test β ≈ b atol=1e-14
     end
@@ -4831,8 +4831,8 @@ end
     # beta = 0 exactly: alpha and gamma are individually undefined and only
     # their sum is determined, so the convention is alpha = 0, gamma = psi.
     for ψ in (0.0, 0.3, 0.7853981633974483, 1.9634954084936207, -2.5)
-        R = Matrix(EBCoDeCMB.Rzyz(0.0, 0.0, ψ))
-        α, β, γ = EBCoDeCMB.euler_zyz_from_R(R)
+        R = Matrix(Scanvolver.Rzyz(0.0, 0.0, ψ))
+        α, β, γ = Scanvolver.euler_zyz_from_R(R)
         @test α == 0.0
         @test β == 0.0
         @test wrap(α + γ) ≈ wrap(ψ) atol=1e-15
@@ -4845,13 +4845,13 @@ end
     # branch and read alpha off two entries that are pure roundoff.
     @test acos(prevfloat(1.0)) > 1e-8
     for ψ in (0.0, 0.7853981633974483, 1.9634954084936207)
-        R = Matrix(EBCoDeCMB.Rzyz(0.0, 0.0, ψ))
+        R = Matrix(Scanvolver.Rzyz(0.0, 0.0, ψ))
         R[3, 3] = prevfloat(1.0)
         R[1, 3] = -4.643e-17
         R[2, 3] = 0.0
         R[3, 1] = 2.3e-17
         R[3, 2] = -1.1e-17
-        α, β, γ = EBCoDeCMB.euler_zyz_from_R(R)
+        α, β, γ = Scanvolver.euler_zyz_from_R(R)
         @test α == 0.0
         @test β < 1e-15
         @test wrap(α + γ) ≈ wrap(ψ) atol=1e-15
@@ -4859,8 +4859,8 @@ end
 
     # beta = pi.
     for (a, c) in ((0.0, 0.4), (1.1, -0.9))
-        R = Matrix(EBCoDeCMB.Rzyz(a, pi, c))
-        α, β, γ = EBCoDeCMB.euler_zyz_from_R(R)
+        R = Matrix(Scanvolver.Rzyz(a, pi, c))
+        α, β, γ = Scanvolver.euler_zyz_from_R(R)
         @test β ≈ pi atol=1e-14
         @test rebuild(α, β, γ) ≈ R atol=1e-14
     end
@@ -4874,9 +4874,9 @@ end
         geometry = ring_geometry(cp, ring)
         for position in 1:geometry.pixel_count
             pixel = geometry.first_pixel + position - 1
-            θ_pixel, φ_pixel = EBCoDeCMB.pix2angRing(cp.resol, pixel)
+            θ_pixel, φ_pixel = Scanvolver.pix2angRing(cp.resol, pixel)
             for ψ in (0.0, 0.7853981633974483, 1.9634954084936207)
-                α, β, γ = EBCoDeCMB.split_rotation(
+                α, β, γ = Scanvolver.split_rotation(
                     φ_pixel,
                     θ_pixel,
                     0.0,
@@ -4933,7 +4933,7 @@ end
     # the leading off-centre leakage terms.
     cp_off_center = ConvolutionParams(nside_output=16)
     pixel = 1537
-    θ_pixel, φ_pixel = EBCoDeCMB.pix2angRing(cp_off_center.resol, pixel)
+    θ_pixel, φ_pixel = Scanvolver.pix2angRing(cp_off_center.resol, pixel)
     φ_off_center = φ_pixel .+ [1.0e-4, -1.5e-4, 0.5e-4]
     θ_off_center = θ_pixel .+ [-0.8e-4, 0.4e-4, 1.2e-4]
     ψ_off_center = [0.1, -0.7, 1.2]
@@ -4946,13 +4946,13 @@ end
     )
     for sample_index in eachindex(ψ_off_center)
         reconstructed =
-            EBCoDeCMB.Rzyz(φ_pixel, θ_pixel, 0.0) *
-            EBCoDeCMB.Rzyz(
+            Scanvolver.Rzyz(φ_pixel, θ_pixel, 0.0) *
+            Scanvolver.Rzyz(
                 angles_off_center.α[sample_index],
                 angles_off_center.β[sample_index],
                 angles_off_center.γ[sample_index],
             )
-        expected = EBCoDeCMB.Rzyz(
+        expected = Scanvolver.Rzyz(
             φ_off_center[sample_index],
             θ_off_center[sample_index],
             ψ_off_center[sample_index],

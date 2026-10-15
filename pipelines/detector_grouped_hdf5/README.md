@@ -12,7 +12,7 @@ d0 = (d0_Qp + d0_Qm + d0_Up + d0_Um) / 4
 d2 = (d2_Qp - d2_Qm + i d2_Up - i d2_Um) / 4
 ```
 
-before mapmaking. The output follows EBCoDeCMB's `x2 = Q + iU` convention.
+before mapmaking. The output follows Scanvolver's `x2 = Q + iU` convention.
 
 Use `convolve_detector_groups_to_hdf5`. The HDF5 map has Julia axes
 `(pixel, stokes, detector_group, sky)` and h5py axes

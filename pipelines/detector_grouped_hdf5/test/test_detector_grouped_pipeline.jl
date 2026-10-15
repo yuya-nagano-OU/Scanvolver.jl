@@ -1,6 +1,6 @@
 using Test
 using CUDA
-using EBCoDeCMB
+using Scanvolver
 using HDF5
 using HDF5: attributes
 using Healpix
@@ -11,7 +11,7 @@ using .DetectorGroupedHDF5
 const OFFSETS = (0.0, pi / 2, pi / 4, 3pi / 4)
 const WEIGHTS = ones(4)
 
-@testset "four-detector sufficient statistics and EBCoDe U sign" begin
+@testset "four-detector sufficient statistics and Scanvolver U sign" begin
     intensity, q, u = 2.3, -0.7, 0.41
     base_psi = 0.37
     angles = [(; num=1, ψ=[base_psi])]

@@ -1,4 +1,4 @@
-using Test, CUDA, EBCoDeCMB, Healpix, HDF5, LinearAlgebra, SHA, TOML, Printf
+using Test, CUDA, Scanvolver, Healpix, HDF5, LinearAlgebra, SHA, TOML, Printf
 using HDF5: attributes
 using NPZ
 include(joinpath(@__DIR__, "..", "beam_batched_pipeline.jl"))
@@ -8,7 +8,7 @@ using .BeamBatchedHDF5
 # tolerances on normalized test signals, not fitted to measured differences.
 const TOLERANCES = Dict(Float32 => (atol=2e-6, rtol=2e-5),
                         Float64 => (atol=1e-12, rtol=1e-11))
-const OUTPUT = abspath(get(ENV, "EBCODE_PIPELINE_TEST_OUTPUT",
+const OUTPUT = abspath(get(ENV, "SCANVOLVER_PIPELINE_TEST_OUTPUT",
                    joinpath(@__DIR__, "..", "test-output", "run_" * string(time_ns()))))
 mkpath(OUTPUT)
 const REPORT = Dict{String,Any}("tolerances" => Dict(string(k) => Dict("atol"=>v.atol, "rtol"=>v.rtol)
@@ -252,7 +252,7 @@ end
 REPORT["julia_version"] = string(VERSION)
 REPORT["cuda_version"] = string(pkgversion(CUDA))
 REPORT["hdf5_version"] = string(pkgversion(HDF5))
-REPORT["ebcodecmb_source"] = pathof(EBCoDeCMB)
+REPORT["scanvolver_source"] = pathof(Scanvolver)
 REPORT["status"] = "passed"
 open(joinpath(OUTPUT,"metrics.toml"),"w") do io
     TOML.print(io,REPORT)

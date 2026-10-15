@@ -2,7 +2,7 @@ module DetectorGroupedHDF5
 
 using CUDA
 using Dates
-using EBCoDeCMB
+using Scanvolver
 using HDF5
 using HDF5: attributes
 using LinearAlgebra
@@ -81,7 +81,7 @@ end
 """
     grouped_ring_stokes(grouped, angles, detector_offsets, detector_weights; ...)
 
-Mapmake detector-grouped sufficient statistics using EBCoDeCMB's existing
+Mapmake detector-grouped sufficient statistics using Scanvolver's existing
 `Q+iU` convention.  Detector offsets rotate both the spin-2 data moment and
 the scan moments.  The standard Qp/Qm/Up/Um quartet makes the joint `h2` and
 `h4` vanish, but they are evaluated explicitly so other offset sets remain
@@ -158,7 +158,7 @@ function make_writer(file, cp, plan, rings, group_batch_size, T, map_precision,
     attrs["polarization_convention"] = "x2=Q+iU"
     attrs["compute_precision"] = string(T)
     attrs["map_precision"] = string(map_precision)
-    attrs["ebcodecmb_source"] = pathof(EBCoDeCMB)
+    attrs["ebcodecmb_source"] = pathof(Scanvolver)
     for key in (:nside_output, :lstart, :lstop, :lmax, :bnmax, :κ, :numofsky)
         attrs[String(key)] = getproperty(cp, key)
     end
@@ -272,7 +272,7 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring,
     geometry = ring_geometry(cp, ring)
     active = moments = nothing
     accumulators = CuArray{Complex{T},4}[]
-    plan_cache = EBCoDeCMB._SkyRingFFTPlanCache()
+    plan_cache = Scanvolver._SkyRingFFTPlanCache()
     try
         active, angles = make_ring_angles(cp, geometry, buffer)
         hits = ring_hit_count(buffer, ring)
@@ -359,7 +359,7 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring,
         ), progress_callback; started_ns)
     finally
         CUDA.synchronize()
-        EBCoDeCMB._release_sky_ring_fft_plans!(plan_cache)
+        Scanvolver._release_sky_ring_fft_plans!(plan_cache)
         foreach(CUDA.unsafe_free!, accumulators)
         moments === nothing || CUDA.unsafe_free!(moments)
         active === nothing || CUDA.unsafe_free!(active.positions)
@@ -371,7 +371,7 @@ end
     convolve_detector_groups_to_hdf5(cp, buffer, alm, blm; output_path, ...)
 
 Convolve every input detector beam, combine consecutive detector groups at the
-sufficient-statistic level, then perform one EBCoDeCMB mapmaking solve per
+sufficient-statistic level, then perform one Scanvolver mapmaking solve per
 group.  This is deliberately separate from `BeamBatchedHDF5.convolve_to_hdf5`.
 The default group order is `Qp,Qm,Up,Um` with offsets
 `0, pi/2, pi/4, 3pi/4`.

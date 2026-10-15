@@ -1,5 +1,5 @@
-# Keep the pre-rename marker so checkpoints written by EBCoDeGPU remain
-# readable after the package becomes EBCoDeCMB.
+# Keep the marker from before the package was renamed, so that older
+# checkpoints stay readable.
 const _CHECKPOINT_MAGIC = b"EBCoDeGPU-ckpt\x00\x00"
 const _CHECKPOINT_VERSION = 2
 const _CHECKPOINT_SIGNATURE_BYTES = 32
@@ -236,7 +236,7 @@ function load_sphere_checkpoint(
     open(path, "r") do io
         magic = read(io, length(_CHECKPOINT_MAGIC))
         magic == _CHECKPOINT_MAGIC || throw(ArgumentError(
-            "$path is not a compatible EBCoDeCMB checkpoint",
+            "$path is not a compatible Scanvolver checkpoint",
         ))
         header = Vector{Int64}(undef, 11)
         read!(io, header)

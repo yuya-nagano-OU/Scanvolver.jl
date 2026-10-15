@@ -1,43 +1,14 @@
 # Notebooks
 
-The notebook environment keeps tutorial-only dependencies out of the package
+The notebook environment keeps notebook-only dependencies out of the package
 environment. From the repository root, instantiate it with:
 
 ```bash
 julia --project=notebook -e 'using Pkg; Pkg.instantiate()'
 ```
 
-The notebook project resolves EBCoDeCMB from the repository root and Falcons from
-its public Git repository through the `[sources]` entries in
-`notebook/Project.toml`.
-
-## Full-sphere pipeline tutorial
-
-`full_sphere_pipeline_tutorial.ipynb` runs the complete GPU pipeline from a
-Falcons pointing stream to `(I, Q, U)` maps. It covers:
-
-- pixel-ordered scan buffering;
-- harmonic sky and beam preparation;
-- the Wigner--Chebyshev plan and memory model;
-- single- and multi-GPU sphere convolution;
-- streaming output modes; and
-- checkpoint and resume.
-
-The sky and Gaussian-beam coefficients are the small validation arrays in
-`test/data`, so no sibling repository or machine-specific path is required.
-The one-year scan is intentionally a research-scale example and requires a
-functional CUDA GPU.
-
-The final legacy-comparison section is optional. To run it, set
-`EBCODE_LEGACY_RESULT` to a compatible JLD2 result file before starting the
-notebook. Without that variable the section reports that it was skipped.
-
-For real multi-GPU parallelism, start Julia with at least as many threads as
-devices, for example:
-
-```bash
-JULIA_NUM_THREADS=8 julia --project=notebook
-```
+The notebook project resolves Scanvolver from the repository root through the
+`[sources]` entry in `notebook/Project.toml`.
 
 ## Validation notebooks
 

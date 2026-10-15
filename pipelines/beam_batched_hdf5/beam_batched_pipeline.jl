@@ -2,7 +2,7 @@ module BeamBatchedHDF5
 
 using CUDA
 using Dates
-using EBCoDeCMB
+using Scanvolver
 using HDF5
 using HDF5: attributes
 using Healpix: Resolution, max_pixrad
@@ -153,7 +153,7 @@ function make_writer(file, cp, plan, rings, batch_size, T, map_precision,
     attributes(file)["stokes_order"] = "I,Q,U"
     attributes(file)["compute_precision"] = string(T)
     attributes(file)["map_precision"] = string(map_precision)
-    attributes(file)["ebcodecmb_source"] = pathof(EBCoDeCMB)
+    attributes(file)["ebcodecmb_source"] = pathof(Scanvolver)
     for key in (:nside_output, :lstart, :lstop, :lmax, :bnmax, :κ, :numofsky, :numofbeam)
         attributes(file)[String(key)] = getproperty(cp, key)
     end
@@ -253,7 +253,7 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
     geometry = ring_geometry(cp, ring)
     active = moments = nothing
     accumulators = CuArray{Complex{T},4}[]
-    plan_cache = EBCoDeCMB._SkyRingFFTPlanCache()
+    plan_cache = Scanvolver._SkyRingFFTPlanCache()
     try
         active, angles = make_ring_angles(cp, geometry, buffer)
         hits = ring_hit_count(buffer, ring)
@@ -328,7 +328,7 @@ function process_ring!(writer, context, cp, buffer, batches, plan, ring;
         ), progress_callback; started_ns)
     finally
         CUDA.synchronize()
-        EBCoDeCMB._release_sky_ring_fft_plans!(plan_cache)
+        Scanvolver._release_sky_ring_fft_plans!(plan_cache)
         foreach(CUDA.unsafe_free!, accumulators)
         moments === nothing || CUDA.unsafe_free!(moments)
         active === nothing || CUDA.unsafe_free!(active.positions)

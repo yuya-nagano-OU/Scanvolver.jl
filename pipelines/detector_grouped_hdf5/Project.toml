@@ -1,14 +1,14 @@
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
 Dates = "ade2ca70-3891-5945-98fb-dc099432e06a"
-EBCoDeCMB = "22ed1dfb-d1ae-44c1-a2c5-7303f99fbd0a"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 Healpix = "9f4e344d-96bc-545a-84a3-ae6b9e1b672b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
+Scanvolver = "531fa2f8-6a2c-4c10-848b-a0fe9acf498e"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [sources]
-EBCoDeCMB = {path = "../.."}
+Scanvolver = {path = "../.."}
 
 [compat]
 CUDA = "5, 6"

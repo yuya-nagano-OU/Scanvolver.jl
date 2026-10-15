@@ -29,6 +29,6 @@ jobs:
       - name: Instantiate
         run: julia --project=. --color=yes -e 'using Pkg; Pkg.instantiate()'
       - name: Load package
-        run: julia --project=. --color=yes -e 'using EBCoDeCMB'
+        run: julia --project=. --color=yes -e 'using Scanvolver'
       - name: Run tests
         run: julia --project=. --color=yes -e 'using Pkg; Pkg.test()'

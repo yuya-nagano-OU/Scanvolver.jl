@@ -1,14 +1,5 @@
 [deps]
-CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
-EBCoDeCMB = "22ed1dfb-d1ae-44c1-a2c5-7303f99fbd0a"
-Falcons = "eba0fb4b-2daf-4740-90d2-e5655143e0a0"
-Healpix = "9f4e344d-96bc-545a-84a3-ae6b9e1b672b"
-JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
-LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
-NPZ = "15e1cf62-19b3-5cfa-8e77-841668bca605"
-Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
+Scanvolver = "531fa2f8-6a2c-4c10-848b-a0fe9acf498e"
 
 [sources]
-EBCoDeCMB = {path = ".."}
-Falcons = {url = "https://github.com/yusuke-takase/Falcons.jl.git"}
+Scanvolver = {path = ".."}

@@ -1,31 +1,26 @@
 # Beam分割・ring保存pipeline
 
-EBCoDeCMBの公開APIを組み合わせ、beamをbatch処理しながら完成したringをHDF5へ保存する。パッケージ本体の変更は不要。新しい入口は `convolve_to_hdf5` で、全空mapを作らず出力ファイルの絶対パスを返す。
+Scanvolverの公開APIを組み合わせ、beamをbatch処理しながら完成したringをHDF5へ保存する。パッケージ本体の変更は不要。新しい入口は `convolve_to_hdf5` で、全空mapを作らず出力ファイルの絶対パスを返す。
 
 置き場所はリポジトリの `pipelines/beam_batched_hdf5`。
 
 ## 実行環境と比較テスト
 
-RTX A6000 2枚で検証済み。比較テストはJuliaを4 threadsで起動する。pipeline自体は1 GPUでも使える。専用Projectが相対パスでこのcheckoutのEBCoDeCMBを参照するため、rootのProject/Manifestを変更しない。
+RTX A6000 2枚で検証済み。比較テストはJuliaを4 threadsで起動する。pipeline自体は1 GPUでも使える。専用Projectが相対パスでこのcheckoutのScanvolverを参照するため、rootのProject/Manifestを変更しない。
 
 ```sh
 # リポジトリのルートで実行する
-EBCODE_JULIA=julia     # Julia 1.12
-EBCODE_PYTHON=python   # h5py が入った Python
-export EBCODE_INPUT_ROOT=/path/to/inputs-root   # representative.jl が読む入力の置き場所
-"$EBCODE_JULIA" --project=pipelines/beam_batched_hdf5 -e 'using Pkg; Pkg.instantiate()'
+SCANVOLVER_JULIA=julia     # Julia 1.12
+SCANVOLVER_PYTHON=python   # h5py が入った Python
+"$SCANVOLVER_JULIA" --project=pipelines/beam_batched_hdf5 -e 'using Pkg; Pkg.instantiate()'
 mkdir -p pipelines/beam_batched_hdf5/test-output
 
-EBCODE_SMALL_OUTPUT=$(mktemp -d "$PWD/pipelines/beam_batched_hdf5/test-output/recheck_small_XXXXXX")
-EBCODE_PIPELINE_TEST_OUTPUT="$EBCODE_SMALL_OUTPUT" "$EBCODE_JULIA" --project=pipelines/beam_batched_hdf5 --threads=4 pipelines/beam_batched_hdf5/test/test_beam_batched_pipeline.jl
-"$EBCODE_PYTHON" pipelines/beam_batched_hdf5/test/verify_h5py.py "$EBCODE_SMALL_OUTPUT"
-
-EBCODE_REP_OUTPUT=$(mktemp -d "$PWD/pipelines/beam_batched_hdf5/test-output/recheck_representative_XXXXXX")
-EBCODE_PIPELINE_TEST_OUTPUT="$EBCODE_REP_OUTPUT" "$EBCODE_JULIA" --project=pipelines/beam_batched_hdf5 --threads=4 pipelines/beam_batched_hdf5/test/representative.jl
-"$EBCODE_PYTHON" pipelines/beam_batched_hdf5/test/verify_h5py.py "$EBCODE_REP_OUTPUT"
+SCANVOLVER_SMALL_OUTPUT=$(mktemp -d "$PWD/pipelines/beam_batched_hdf5/test-output/recheck_small_XXXXXX")
+SCANVOLVER_PIPELINE_TEST_OUTPUT="$SCANVOLVER_SMALL_OUTPUT" "$SCANVOLVER_JULIA" --project=pipelines/beam_batched_hdf5 --threads=4 pipelines/beam_batched_hdf5/test/test_beam_batched_pipeline.jl
+"$SCANVOLVER_PYTHON" pipelines/beam_batched_hdf5/test/verify_h5py.py "$SCANVOLVER_SMALL_OUTPUT"
 ```
 
-`test_beam_batched_pipeline.jl` は入力を内部生成し、nside=8、2 skies、5 beamsをbatch 1/2/5、Float32/Float64、1/2 GPUで比較する。`representative.jl` はCMB seed 0/1と5個の回転Gaussian beamを読み、nside=256、lmax=200、bnmax=120、κ=20の8 ringで比較する。走査点はpixelの角付近に生成する小さなfixtureであり、実際の年間走査ではない。入力の置き場所は環境変数 `EBCODE_INPUT_ROOT` で指定する（必須）。
+`test_beam_batched_pipeline.jl` は入力を内部生成し、nside=8、2 skies、5 beamsをbatch 1/2/5、Float32/Float64、1/2 GPUで比較する。beam_batch_size を変えると、縮約の行列積（`src/convolution/contraction.jl` の `gemm_strided_batched!`）の出力列数が変わってcuBLAS 内部の加算順序が変わるため、結果は丸めの範囲で変わる（beam を掛ける段 `apply_beams_gemm_gpu` の出力は batch によらずビット単位で同じ）。そのため比較は許容誤差で行う。
 
 出力は `metrics.toml`、HDF5 map、参照mapの `.npy`、Python検証の `h5py_verification.json`。参照との比較に限り、テスト側では小規模の全空mapをRAMに読み込む。pipelineにはこの割当てはない。`test-output/` と専用 `Manifest.toml` はgitignore対象で、検証時のManifestは検証したマシンに残す。
 
@@ -34,8 +29,8 @@ EBCODE_PIPELINE_TEST_OUTPUT="$EBCODE_REP_OUTPUT" "$EBCODE_JULIA" --project=pipel
 既存APIで用意した `cp::ConvolutionParams`、`buffer::RingScanBuffer`、同じ精度の `PreparedAlm` / `PreparedBlm` を渡す。
 
 ```julia
-using EBCoDeCMB
-include(joinpath(pkgdir(EBCoDeCMB), "pipelines", "beam_batched_hdf5", "beam_batched_pipeline.jl"))
+using Scanvolver
+include(joinpath(pkgdir(Scanvolver), "pipelines", "beam_batched_hdf5", "beam_batched_pipeline.jl"))
 using .BeamBatchedHDF5
 
 # cp, buffer, raw_alms, raw_blmsは利用する入力から準備する。
@@ -103,7 +98,7 @@ GPU上に全beam分残すのは現在のringのaccumulatorであり、その大�
 | `rings/estimated_tile_bytes`, `rings/accumulator_bytes` | 明示GPUバッファの見積り。実測peak使用量ではない |
 | `run_state` | 0=実行中、1=要求ringがすべて完了、2=失敗 |
 
-HDF5.jlは次元を反転してdiskへ保存するため、Juliaで `file["map"]` を直接読むと `(pixel, stokes, beam, sky)`。`read_ring_hdf5` はEBCoDeCMBと同じ `(sky, beam, stokes, ring_pixel)` へ戻す。固定長の文字列属性はh5pyではbytesとして返る。
+HDF5.jlは次元を反転してdiskへ保存するため、Juliaで `file["map"]` を直接読むと `(pixel, stokes, beam, sky)`。`read_ring_hdf5` はScanvolverと同じ `(sky, beam, stokes, ring_pixel)` へ戻す。固定長の文字列属性はh5pyではbytesとして返る。
 
 ```python
 import h5py
@@ -118,5 +113,3 @@ with h5py.File("/absolute/path/map.h5", "r") as f:
 mapはchunked datasetで、ringのhyperslabを順次書く。HDF5アクセスとcallbackは共通lockで直列化し、GPU workerをすべてjoinしてからファイルを閉じる。各ringのmapを書いてflushした後にcompleted flagを書いてflushする。例外時はGPU資源をfinallyで解放し、完了したringの記録を残す。OS強制終了・電源断時のトランザクション保証や自動再開は今回の実装には含まない。ファイルの読出しは処理終了後に行い、部分ファイルでは必ずcompletedを確認する。
 
 `batch_callback` は書込み後・ring完了前にring/batchだけの借用CPU配列を受け取る。`progress_callback` は完了記録後に呼ぶ。callback例外も呼出し元に伝播する。
-
-検証結果、受入れ誤差、対象外の条件は同directoryの `VALIDATION.md` に記録した。
