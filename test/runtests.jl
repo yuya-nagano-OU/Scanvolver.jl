@@ -3811,7 +3811,9 @@ end
             θ_off_center[sample_index],
             ψ_off_center[sample_index],
         )
-        @test reconstructed ≈ expected atol=2e-14
+        # Equivalent Euler rotations can differ slightly across libm and
+        # processor implementations near this off-centre configuration.
+        @test reconstructed ≈ expected atol=2e-13
     end
 
     @test_throws ArgumentError Angles(
