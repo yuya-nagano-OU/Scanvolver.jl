@@ -72,9 +72,17 @@ prepared_blm = prepare_blm(cp, blm_teb)
 Full-sky convolution is `convolve_to_hdf5`: it takes the configuration, a
 pixel-ordered scan buffer and the prepared skies and beams, convolves every
 ring on one or more GPUs, and writes the `(I, Q, U)` maps of every sky and beam
-to an HDF5 file ring by ring. See [`docs/hdf5_output.md`](docs/hdf5_output.md)
-for the call, the file layout and the detector-group variant, and
-[`notebook/README.md`](notebook/README.md) for the validation notebooks.
+to an HDF5 file ring by ring.
+
+## Documentation
+
+- [HDF5 convolution and output](docs/hdf5_output.md): complete calls to
+  `convolve_to_hdf5` and `convolve_detector_groups_to_hdf5`, runtime parameter
+  defaults and tuning guidance, GPU scheduling, and the output-file schema.
+- [Tutorial notebook](notebook/tutorial.ipynb): generate a year of Falcons.jl
+  pointings in monthly chunks for a few rings, prepare harmonic inputs, run
+  GPU convolution, and read and plot the HDF5 results. See the
+  [notebook setup](notebook/README.md) for its environment and GPU requirements.
 
 ## Current scope
 

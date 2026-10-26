@@ -46,6 +46,44 @@ subset = read_ring_hdf5(path, 1; skies=1:1, beams=1:2)
 - HWP and noise are rejected.
 - With more than one device, start Julia with at least one thread per GPU.
 
+### Runtime options
+
+The keyword arguments to `convolve_to_hdf5` control GPU scheduling, memory
+use, numerical output and bookkeeping. The defaults are intended to be a
+reasonable starting point; in particular, `l_tile=:auto` normally removes the
+need to tune the tile width by hand.
+
+| Keyword | Default | Meaning |
+|---|---:|---|
+| `output_path` | required | New HDF5 file to create. Its parent directory must exist, and an existing path is never overwritten. |
+| `beam_batch_size` | `9` | Number of beams applied together. Larger batches can improve throughput but require more temporary GPU memory. |
+| `devices` | `[0]` | Zero-based CUDA device IDs. Each device needs one Julia thread. |
+| `rings` | every buffered ring | Unique ring numbers to process, all inside the `RingScanBuffer`. |
+| `beta_order` | `8` | Chebyshev order used for the automatic small-angle Wigner representation. |
+| `l_tile` | `:auto` | Multipole tile width. `:auto` chooses the widest tile allowed by the memory budget. |
+| `max_l_tile` | `32` | Upper limit on the automatically selected tile width. |
+| `memory_fraction` | `0.7` | Fraction of currently available GPU memory that the tile selector may use. Must be in `(0, 1]`. |
+| `moment_method` | `:gemm` | GPU scan-moment implementation. The production default is `:gemm`; `:direct` is also available. |
+| `map_precision` | input precision | Element type of the output map, either `Float32` or `Float64`. Compute precision comes from the prepared inputs. |
+| `rcond` | `1e-2` | Relative conditioning threshold for the per-pixel `(I,Q,U)` solve. Insufficiently constrained pixels become `unseen`. |
+| `unseen` | `NaN` | Value written for unobserved or insufficiently constrained pixels. It must be finite or `NaN`, not infinity. |
+| `reclaim_interval` | `16` | Number of rings processed by each GPU worker between `CUDA.synchronize()` and `CUDA.reclaim()` calls. Set to `0` to disable periodic reclamation. |
+| `sky_ids`, `beam_ids` | `"1"`, `"2"`, ... | Labels stored along the corresponding HDF5 axes. Their lengths must match `numofsky` and `numofbeam`. |
+| `metadata` | empty | Run-level values stored in the HDF5 `metadata/` group. |
+| `beam_metadata` | empty | Per-beam vectors stored in `beam_metadata/`; every vector must have one element per beam. |
+| `batch_callback` | `nothing` | Called after one beam batch has been written. The supplied CPU array is borrowed and ring-local. |
+| `progress_callback` | `nothing` | Called after a ring has been completely written and marked complete. |
+
+`reclaim_interval` controls a memory-management tradeoff, not the numerical
+algorithm. CUDA.jl normally caches released allocations for reuse. Periodic
+reclamation returns unused cached allocations and can keep long runs within a
+tighter memory envelope, but synchronization and later reallocation add some
+overhead. Lower the interval if cached GPU memory becomes a problem; increase
+it, or use `0`, when allocation reuse and throughput are more important. The
+counter is maintained independently by each GPU worker, so the default means
+reclamation after every 16 rings handled by that device, not every 16 rings
+globally.
+
 ## The β range
 
 `beta_max` follows from the output resolution: HEALPix's centre-to-corner

@@ -1,5 +1,19 @@
 [deps]
+CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+Falcons = "eba0fb4b-2daf-4740-90d2-e5655143e0a0"
+HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
+IJulia = "7073ff75-c697-5162-941a-fcdaad2a7d2a"
+Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
+Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Scanvolver = "531fa2f8-6a2c-4c10-848b-a0fe9acf498e"
 
 [sources]
 Scanvolver = {path = ".."}
+
+[compat]
+CUDA = "5, 6"
+Falcons = "1.0.1"
+HDF5 = "0.17"
+IJulia = "1"
+Plots = "1"
+julia = "1.12"
