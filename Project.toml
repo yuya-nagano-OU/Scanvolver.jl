@@ -1,7 +1,7 @@
 name = "Scanvolver"
 uuid = "531fa2f8-6a2c-4c10-848b-a0fe9acf498e"
 authors = ["Yuya Nagano"]
-version = "0.1.0-DEV"
+version = "0.1.0"
 
 [deps]
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
