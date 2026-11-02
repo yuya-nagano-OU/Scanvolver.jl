@@ -76,6 +76,7 @@ to an HDF5 file ring by ring.
 
 ## Documentation
 
+- [Rotating HWP convolution](docs/hwp_convolution.md): Mueller mixing, the `2ψ+4η` convention, phase-bearing scans, and V=0 scope.
 - [HDF5 convolution and output](docs/hdf5_output.md): complete calls to
   `convolve_to_hdf5` and `convolve_detector_groups_to_hdf5`, runtime parameter
   defaults and tuning guidance, GPU scheduling, and the output-file schema.
@@ -100,7 +101,7 @@ Current limitations:
 
 - Production convolution requires CUDA; CUDA is not an optional dependency in
   this development release.
-- The current GPU beam preparation and convolution path supports `HWP=false`.
+- Rotating HWP/Mueller convolution supports TEB inputs with V=0; use `prepare_hwp_blm` for HWP runs.
 - The HDF5 drivers record which rings are complete but do not resume an
   interrupted run.
 - Julia versions older than 1.12 have not yet been validated.

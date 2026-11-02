@@ -1,9 +1,10 @@
 """
-    Angles(cp; pix, φ, θ, ψ, time_array=nothing, eps=1e-12)
+    Angles(cp; pix, φ, θ, ψ, time_array=nothing, hwp_angle=nothing, hwp_phase_rad=0, eps=1e-12)
 
 Per-sample local Euler angles for one HEALPix pixel. The pointing vectors
-`φ`, `θ`, and `ψ` must have equal lengths. `time_array` is required when
-`cp.HWP` is enabled and is otherwise optional.
+`φ`, `θ`, and `ψ` must have equal lengths. With `cp.HWP`, provide measured
+`hwp_angle` samples or absolute `time_array` samples. Generated phases include
+`hwp_phase_rad`; explicit angles are used as supplied modulo 2π.
 """
 mutable struct Angles
     θ_pix::Float64
@@ -24,6 +25,8 @@ function Angles(
     θ::Vector{T},
     ψ::Vector{T},
     time_array::Union{Nothing, AbstractVector{<:Real}}=nothing,
+    hwp_angle::Union{Nothing, AbstractVector{<:Real}}=nothing,
+    hwp_phase_rad::Real=0.0,
     eps::T=1e-12,
 ) where {T<:AbstractFloat}
     sample_count = length(φ)
@@ -35,7 +38,7 @@ function Angles(
     ))
 
     if time_array === nothing
-        cp.HWP && throw(ArgumentError(
+        cp.HWP && hwp_angle === nothing && throw(ArgumentError(
             "time_array must be provided when HWP=true",
         ))
         times = Float64[]
@@ -49,9 +52,15 @@ function Angles(
         ))
     end
 
-    if cp.HWP
+    isfinite(hwp_phase_rad) || throw(ArgumentError("hwp_phase_rad must be finite"))
+    if hwp_angle !== nothing
+        cp.HWP || throw(ArgumentError("hwp_angle requires HWP=true"))
+        length(hwp_angle) == sample_count && all(isfinite, hwp_angle) ||
+            throw(ArgumentError("hwp_angle requires one finite angle per hit"))
+        η = mod.(Float64.(hwp_angle), 2π)
+    elseif cp.HWP
         angular_velocity = 2π * cp.HWP_rpm / 60
-        η = mod.(angular_velocity .* times, 2π)
+        η = mod.(angular_velocity .* times .+ hwp_phase_rad, 2π)
     else
         η = Float64[]
     end

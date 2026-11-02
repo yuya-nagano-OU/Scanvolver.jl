@@ -6,7 +6,7 @@ and mapmaking. The multipole range must satisfy
 `0 <= lstart <= lstop <= lmax`; `numofsky` and `numofbeam` set the batch axes,
 `bnmax` limits beam azimuthal modes, and `κ` controls the scan-moment band.
 
-The current GPU convolution path supports `HWP=false`. When `HWP=true`,
+For HWP convolution use `prepare_hwp_blm` and the HDF5 drivers. When `HWP=true`,
 `HWP_rpm` is required and is used while constructing `Angles`.
 """
 struct ConvolutionParams{I<:Int, B<:Bool}

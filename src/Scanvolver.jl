@@ -15,6 +15,7 @@ include("angles.jl")
 include("harmonics/alm.jl")
 include("harmonics/alm_gpu.jl")
 include("harmonics/blm.jl")
+include("hwp.jl")
 include("scan_moment_plan.jl")
 include("scan_moments/scan_moments_cpu.jl")
 include("scan_moments/scan_moments_direct_gpu.jl")
@@ -40,6 +41,7 @@ export ConvolutionParams, Angles, show_cp
 export PreparedAlm, prepare_alm, alm_slice
 export GPUAlm, upload_alm_gpu
 export PreparedBlm, prepare_blm, blm_slice, beam_batches
+export PreparedHWPBlm, prepare_hwp_blm
 export ScanMomentPlan, chebyshev_nodes, automatic_beta_max, automatic_scan_plan
 export scan_moments_cpu, scan_moments_gpu
 export scan_moments_direct_gpu, scan_moments_gemm_gpu
