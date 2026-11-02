@@ -24,18 +24,23 @@ function _kappa_wigner_d(l::Int, M::Int, n::Int, beta::Float64)
 end
 
 """
-    estimate_kappa(lmax, nmax, nside, threshold; kwargs...) -> Int
-    estimate_kappa(lmax, nmax, nside; threshold=1e-2, kwargs...) -> Int
+    estimate_kappa(; nside, lmax, nmax, ε=1e-5, kwargs...) -> Int
+    estimate_kappa(ε; nside, lmax, nmax, kwargs...) -> Int
+
+`nside`, `lmax`, and `nmax` are required keyword arguments. The amplitude
+tolerance `ε` defaults to `1e-5` and can be supplied either by keyword or
+as the sole positional argument, but not both. Geometry inputs cannot be
+passed positionally.
 
 Estimate the smallest non-negative Fourier band `kappa` at **one endpoint**:
 `l = lmax`, `beta = automatic_beta_max(nside; precision=Float64)`. Retain
 `abs(M-n) <= kappa`; require every omitted component, for `abs(n) <= nmax`
-and `abs(M) <= lmax`, to have magnitude at most `threshold` after normalization.
+and `abs(M) <= lmax`, to have magnitude at most `ε` after normalization.
 
 The default `normalization=:diagonal` uses
 `abs(d^l_{M,n}(beta)) / abs(d^l_{n,n}(beta))`. `normalization=:absolute`
 instead tests `abs(d^l_{M,n}(beta))` without dividing by the diagonal.
-`threshold` is an **amplitude**, not a power or map-error tolerance.
+`ε` is an **amplitude**, not a power or map-error tolerance.
 
 Keyword arguments:
 
@@ -60,16 +65,17 @@ it does not alter `ConvolutionParams` or a running pipeline.
 
 # Examples
 ```julia
-kappa = estimate_kappa(1000, 200, 512, 1e-2)  # 5
-info = estimate_kappa(1000, 200, 512, 1e-2; details=true)
+kappa = estimate_kappa(; nside=512, lmax=1000, nmax=200)  # 9, ε=1e-5
+kappa = estimate_kappa(1e-8; nside=512, lmax=1000, nmax=200)  # 12
+info = estimate_kappa(1e-8; nside=512, lmax=1000, nmax=200, details=true)
 info.kappa, info.beta_max, info.omitted_maximum_bound
 ```
 """
-function estimate_kappa(
+function estimate_kappa(;
+    nside::Integer,
     lmax::Integer,
     nmax::Integer,
-    nside::Integer,
-    threshold::Real;
+    ε::Real=1e-5,
     beta_max::Union{Nothing,Real}=nothing,
     normalization::Symbol=:diagonal,
     diagonal_atol::Real=sqrt(eps(Float64)),
@@ -78,8 +84,8 @@ function estimate_kappa(
     lmax >= 0 || throw(ArgumentError("lmax must be non-negative"))
     0 <= nmax <= lmax || throw(ArgumentError("nmax must satisfy 0 <= nmax <= lmax"))
     nside > 0 || throw(ArgumentError("nside must be positive"))
-    isfinite(threshold) && threshold > 0 || throw(ArgumentError(
-        "threshold must be finite and positive",
+    isfinite(ε) && ε > 0 || throw(ArgumentError(
+        "ε must be finite and positive",
     ))
     normalization in (:diagonal, :absolute) || throw(ArgumentError(
         "normalization must be :diagonal or :absolute",
@@ -95,9 +101,9 @@ function estimate_kappa(
     isfinite(beta) && 0 <= beta <= Float64(pi) || throw(ArgumentError(
         "beta_max must be finite and in [0, pi] radians",
     ))
-    target, diagonal_floor = Float64(threshold), Float64(diagonal_atol)
+    target, diagonal_floor = Float64(ε), Float64(diagonal_atol)
     isfinite(target) && target > 0 || throw(ArgumentError(
-        "threshold must be representable as a finite positive Float64",
+        "ε must be representable as a finite positive Float64",
     ))
     isfinite(diagonal_floor) || throw(ArgumentError(
         "diagonal_atol must be representable as a finite Float64",
@@ -178,11 +184,12 @@ function estimate_kappa(
 end
 
 function estimate_kappa(
+    ε::Real;
+    nside::Integer,
     lmax::Integer,
     nmax::Integer,
-    nside::Integer;
-    threshold::Real=1e-2,
     kwargs...,
 )
-    return estimate_kappa(lmax, nmax, nside, threshold; kwargs...)
+    haskey(kwargs, :ε) && throw(ArgumentError("ε must be supplied either positionally or by keyword, not both"))
+    return estimate_kappa(; nside, lmax, nmax, ε, kwargs...)
 end

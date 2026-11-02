@@ -24,6 +24,7 @@ include("wigner/wigner_seed.jl")
 include("wigner/ringd_gpu.jl")
 include("wigner/wigner_table_gpu.jl")
 include("wigner/wigner_table_cpu.jl")
+include("tools.jl")
 include("effective_beam.jl")
 include("sky_ring/sky_ring.jl")
 include("sky_ring/active_pixels.jl")
@@ -45,6 +46,7 @@ export scan_moments_cpu, scan_moments_gpu
 export scan_moments_direct_gpu, scan_moments_gemm_gpu
 export scan_moments_gemm_memory_bytes
 export calc_Mmax, calc_nmax
+export estimate_kappa
 export ringd_blocks_recursion_gpu!
 export RingDContext, ringd_context, free_ringd_context!
 export WignerChebyshevTable
