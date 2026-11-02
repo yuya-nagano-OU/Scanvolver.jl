@@ -5,6 +5,7 @@ using LinearAlgebra: cond
 using Test
 
 include("cpu_reference.jl")
+include("test_kappa_estimate.jl")
 
 # GPU conveniences for the tests. The HDF5 pipelines do the same inline.
 

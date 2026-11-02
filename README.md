@@ -77,6 +77,10 @@ to an HDF5 file ring by ring.
 ## Documentation
 
 - [Rotating HWP convolution](docs/hwp_convolution.md): Mueller mixing, the `2ψ+4η` convention, phase-bearing scans, and V=0 scope.
+- [Kappa estimation](docs/kappa_estimation.md): choose a candidate Fourier band
+  with `estimate_kappa(; nside, lmax, nmax)` on the CPU (default `ε=1e-5`,
+  optionally the sole positional argument), including
+  the normalization, endpoint-only scope, and convergence-test caveats.
 - [HDF5 convolution and output](docs/hdf5_output.md): complete calls to
   `convolve_to_hdf5` and `convolve_detector_groups_to_hdf5`, runtime parameter
   defaults and tuning guidance, GPU scheduling, and the output-file schema.
@@ -89,6 +93,7 @@ to an HDF5 file ring by ring.
 
 - Packed harmonic sky and beam preparation
 - CPU and GPU scan moments
+- CPU-only kappa-band estimation from Wigner-d amplitudes
 - Wigner--Chebyshev tables built on the CPU and uploaded to the GPU
 - GPU effective-kernel construction and beam application
 - Full-sky convolution to HDF5, with beams processed in batches
