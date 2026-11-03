@@ -10,6 +10,7 @@ struct PreparedHWPBlm{T<:_HARMONIC_PRECISIONS}
     components::Vector{PreparedBlm{T}}
     modes::Vector{Symbol}
     mueller::Matrix{Float64}
+    lowell_hwp::Symbol
     lstart::Int
     lstop::Int
     lmax::Int
@@ -39,7 +40,7 @@ end
 
 """
     prepare_hwp_blm(cp, blms; mueller=diag(1,1,-1,-1), input_basis=:teb,
-                    precision=Float64)
+                    precision=Float64, lowell_hwp=:shifted)
 
 Prepare a rotating Mueller element in front of asymmetric detector beams.
 Inputs are TEB (or spin 0,+2,-2); sky V and beam V are zero. The real 4x4
@@ -52,15 +53,31 @@ order n is (scale[X]/scale[Y])*C[X,Y]*conj(b[X,n-t]). Thus no second
 conjugation is applied to the prepared physical beam. Signed modes are
 combined analytically into 1, cos(2η), sin(2η), cos(4η), sin(4η).
 Only exactly zero components are omitted; weak 2f terms are retained.
+
+With `lowell_hwp=:full_sum`, retain the beam multipole sum for the scalar
+I-input ell=0,1 2f terms proportional to M_QI and M_UI. The Mueller matrix
+is uniform in beam-centred Ludwig-3 coordinates. The sum uses polarized
+input beam multipoles 2:lmax (even when lstop<lmax), truncated at bnmax.
+All other terms retain the shifted-beam approximation. The default
+`:shifted` preserves the original results, and spin-2 ell<2 stays zero.
 """
 function prepare_hwp_blm(cp::ConvolutionParams, blms::AbstractVector;
                          mueller=[1.0 0 0 0; 0 1 0 0; 0 0 -1 0; 0 0 0 -1],
-                         input_basis::Symbol=:teb, precision::Type=Float64)
+                         input_basis::Symbol=:teb, precision::Type=Float64,
+                         lowell_hwp::Symbol=:shifted)
     cp.HWP || throw(ArgumentError("prepare_hwp_blm requires HWP=true"))
+    lowell_hwp in (:shifted, :full_sum) ||
+        throw(ArgumentError("lowell_hwp must be :shifted or :full_sum"))
     M, C = _hwp_coherence(mueller)
     physical_cp = ConvolutionParams(cp; HWP=false)
     physical = prepare_blm(physical_cp, blms; input_basis, precision)
     T = precision
+    lowell = if lowell_hwp === :full_sum && cp.lstart <= 1 && cp.lmax >= 2 &&
+                any(!iszero, C[2:3, 1])
+        _prepare_hwp_lowell(cp, blms, input_basis, C, T)
+    else
+        nothing
+    end
     effective_bnmax = min(cp.bnmax + 4, cp.lmax)
     sigma = (0, 2, -2)
     scales = (1.0, inv(sqrt(2.0)), inv(sqrt(2.0)))
@@ -92,6 +109,10 @@ function prepare_hwp_blm(cp::ConvolutionParams, blms::AbstractVector;
                 end
             end
         end
+        if lowell !== nothing && l < 2
+            blocks[2][1] .+= lowell[l][1]
+            blocks[3][1] .+= lowell[l][2]
+        end
         for j in eachindex(slices)
             push!(slices[j], blocks[j])
         end
@@ -101,7 +122,7 @@ function prepare_hwp_blm(cp::ConvolutionParams, blms::AbstractVector;
     isempty(active) && push!(active, 1)
     components = [PreparedBlm{T}(slices[j], cp.lstart, cp.lstop, cp.lmax,
                                 effective_bnmax, cp.numofbeam) for j in active]
-    return PreparedHWPBlm{T}(components, collect(_HWP_MODES)[active], M,
+    return PreparedHWPBlm{T}(components, collect(_HWP_MODES)[active], M, lowell_hwp,
                             cp.lstart, cp.lstop, cp.lmax, cp.bnmax,
                             effective_bnmax, cp.numofbeam)
 end
@@ -113,7 +134,7 @@ function beam_batches(blm::PreparedHWPBlm{T}, batch_size::Integer) where {T}
     batches = [beam_batches(component, batch_size) for component in blm.components]
     return [(indices=batches[1][j].indices,
              blm=PreparedHWPBlm{T}([batch[j].blm for batch in batches], copy(blm.modes),
-                  copy(blm.mueller), blm.lstart, blm.lstop, blm.lmax, blm.bnmax,
+                  copy(blm.mueller), blm.lowell_hwp, blm.lstart, blm.lstop, blm.lmax, blm.bnmax,
                   blm.effective_bnmax, length(batches[1][j].indices)))
             for j in eachindex(batches[1])]
 end

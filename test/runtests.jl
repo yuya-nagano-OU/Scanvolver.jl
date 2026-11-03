@@ -3844,3 +3844,4 @@ end
 include("test_hdf5_pipelines.jl")
 
 include("test_hwp.jl")
+include("test_hwp_lowell.jl")

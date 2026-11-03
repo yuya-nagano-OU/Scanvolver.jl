@@ -145,9 +145,9 @@ end
     cp=ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=4,HWP=true,HWP_rpm=0.)
     scan=hwp_test_scan(cp)
     buffer=build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi;hwp_angle=scan.eta)
-    active,angles=make_ring_angles(cp,ring_geometry(cp,7),buffer)
     plan=automatic_scan_plan(ConvolutionParams(cp;HWP=false);beta_order=8,precision=Float64)
     if CUDA.functional()
+        active,angles=make_ring_angles(cp,ring_geometry(cp,7),buffer)
         for mode in Scanvolver._HWP_MODES
             direct=scan_moments_direct_gpu(plan,angles;hwp_mode=mode,demodulate_hwp=true)
             gemm=scan_moments_gemm_gpu(plan,angles;hwp_mode=mode,demodulate_hwp=true)

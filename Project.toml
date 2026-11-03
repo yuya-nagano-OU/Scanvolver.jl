@@ -11,6 +11,7 @@ Healpix = "9f4e344d-96bc-545a-84a3-ae6b9e1b672b"
 LinearAlgebra = "37e2e46d-f89d-539d-b4ee-838fcccc9c8e"
 SpecialFunctions = "276daf66-3868-5448-9aa4-cd146d93841b"
 StaticArrays = "90137ffa-7385-5640-81b9-e52037218182"
+WignerFamilies = "a8f88a7a-0a89-491c-8ecb-051e99aa9f5e"
 
 [compat]
 CUDA = "5, 6"
@@ -18,6 +19,7 @@ HDF5 = "0.17"
 Healpix = "4.2.4"
 SpecialFunctions = "2.7"
 StaticArrays = "1.9.18"
+WignerFamilies = "1.0.2"
 julia = "1.12"
 
 [extras]

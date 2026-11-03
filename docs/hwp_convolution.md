@@ -105,12 +105,72 @@ unchanged. HDF5.jl reverses dataset dimensions on disk; the Mueller dataset is
 `(output,input)` when read in Julia and `(input,output)` in Python. The file
 records both axis orders explicitly.
 
+## Optional low-ell intensity response
+
+The default `lowell_hwp=:shifted` keeps the original approximation. In that
+model, the I-input ell=0,1 2f terms proportional to `M_QI` and `M_UI` are
+absent: the same-ell polarized beam coefficients do not exist. This is a
+limitation of the shifted-beam model, not a statement that physical intensity
+monopoles and dipoles cannot generate a 2f signal. LBS uses the same shifted
+model and therefore cannot independently validate these terms.
+
+To retain the beam multipole sum for just these terms, use:
+
+```julia
+# A passive HWP: principal-axis intensity transmissions 0.99 and 0.97,
+# with pi relative retardance. Matrix rows are outputs and columns inputs.
+g = sqrt(0.99 * 0.97)
+M = [0.98 0.01 0 0; 0.01 0.98 0 0; 0 0 -g 0; 0 0 0 -g]
+beam = prepare_hwp_blm(cp, blm_teb; mueller=M, lowell_hwp=:full_sum)
+```
+
+The spatial assumption is a Mueller matrix uniform in the beam-centred
+Ludwig-3 frame. Multiplying a spin-2 beam by the Mueller spatial mode
+produces a scalar effective beam with ell=0,1. No spin-2 coefficient below
+ell=2 is introduced, and the original spin-2 guards remain in place.
+
+For output scalar multipole `ell`, Wigner order `n`, HWP harmonic `t=+/-2`,
+and polarized input beam order `k=n-t`, the scalar projection weight is
+
+```math
+W_{\ell n t,\ell_1} = \sum_{\ell_2}
+(-1)^{n+\ell_2}\frac{2(2\ell_2+1)}{\ell_2(\ell_2+1)}
+\sqrt{(2\ell_1+1)(2\ell+1)}
+\begin{pmatrix}\ell_1&\ell_2&\ell\\-t&t&0\end{pmatrix}
+\begin{pmatrix}\ell_1&\ell_2&\ell\\n-t&t&-n\end{pmatrix}.
+```
+
+The sum uses polarized input beam multipoles `ell1=2:cp.lmax`, with the
+physical `bnmax` cutoff. There is no extra fixed multipole cutoff. In
+particular, `lstop` limits the sky/output multipoles, not this input beam
+sum; a low-ell-only run may set `lstop=1` while retaining the full beam and
+its `lmax`-sized input arrays.
+
+The triangle rule leaves one `ell2` for ell=0, and at most three for ell=1.
+`WignerFamilies.jl` evaluates these short 3j families. Weights are computed
+once per beam-preparation call and reused across detector beams, in O(lmax)
+work per output coefficient. Summation uses Float64 before casting to the
+requested storage precision. No additional time-domain or GPU operation
+is needed; the result uses the existing cos2/sin2 Fourier beams. HDF5 files
+record the choice in the `hwp_lowell` attribute, and beam batches retain it.
+
+Only the **I-input ell=0,1 2f terms** are extended. Polarized sky has no
+ell<2 coefficients; all other terms, including ell>=2 and shifts with
+`abs(n)>ell`, retain the previous treatment. With no `M_QI/M_UI` coupling
+the prepared coefficients are unchanged. With no intensity sky monopole or
+dipole the additional coefficients do not contribute to the signal.
+
+Nominal I/4f mapmaking can suppress 2f when the HWP-angle coverage is good.
+The residual depends on the scan, input sky, and Mueller matrix; neither
+the option nor a small toy-beam test establishes its production-map size.
+
 ## Validation
 
 Run the package suite, or the focused checks:
 
 ```sh
 julia --project=. --threads=2 test/test_hwp.jl
+julia --project=. --threads=2 test/test_hwp_lowell.jl
 ```
 
 Checks cover phase transport across chunks and pixel sorting, harmonic

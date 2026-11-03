@@ -256,6 +256,7 @@ function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, 
                 attributes(file)["hwp_angle_frame"] = "beam focal plane"
                 attributes(file)["hwp_demodulation"] = "2psi+4eta"
                 attributes(file)["hwp_effective_bnmax"] = blm.effective_bnmax
+                attributes(file)["hwp_lowell"] = string(blm.lowell_hwp)
                 attributes(file)["hwp_mueller_julia_axes"] = "output_Stokes,input_Stokes"
                 attributes(file)["hwp_mueller_disk_axes"] = "input_Stokes,output_Stokes"
                 file["hwp_mueller_iquv"] = blm.mueller

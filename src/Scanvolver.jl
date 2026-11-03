@@ -8,6 +8,7 @@ using Healpix: Resolution, pix2angRing, ang2pixRing, getringinfo,
 using LinearAlgebra: cond, lu
 using SpecialFunctions: loggamma
 using StaticArrays: @SMatrix
+using WignerFamilies: wigner3j_f
 
 include("rotation.jl")
 include("parameters.jl")
@@ -15,6 +16,7 @@ include("angles.jl")
 include("harmonics/alm.jl")
 include("harmonics/alm_gpu.jl")
 include("harmonics/blm.jl")
+include("hwp_lowell.jl")
 include("hwp.jl")
 include("scan_moment_plan.jl")
 include("scan_moments/scan_moments_cpu.jl")
