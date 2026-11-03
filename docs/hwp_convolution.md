@@ -166,11 +166,10 @@ the option nor a small toy-beam test establishes its production-map size.
 
 ## Validation
 
-Run the package suite, or the focused checks:
+Run the package suite, including the HWP checks:
 
 ```sh
-julia --project=. --threads=2 test/test_hwp.jl
-julia --project=. --threads=2 test/test_hwp_lowell.jl
+julia --project=. --threads=2 test/runtests.jl
 ```
 
 Checks cover phase transport across chunks and pixel sorting, harmonic

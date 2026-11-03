@@ -1,7 +1,8 @@
 using Scanvolver
 using CUDA
 using Healpix: Alm, almIndex, alm2map, numberOfAlms
-using LinearAlgebra: cond
+using LinearAlgebra: cond, I, SymTridiagonal, eigen
+using HDF5: h5open, attributes
 using Test
 
 include("cpu_reference.jl")
@@ -3843,5 +3844,399 @@ end
 
 include("test_hdf5_pipelines.jl")
 
-include("test_hwp.jl")
-include("test_hwp_lowell.jl")
+# HWP reference helpers and regression tests.
+
+const _HWP_IDEAL_TEST = [1.0 0 0 0; 0 1 0 0; 0 0 -1 0; 0 0 0 -1]
+
+function hwp_test_coefficients(lmax, seed)
+    result = zeros(ComplexF64, 3, (lmax + 1) * (lmax + 2) ÷ 2)
+    for m in 0:lmax, l in m:lmax, s in 1:3
+        s > 1 && l < 2 && continue
+        j = Scanvolver._packed_alm_index(l, m, lmax)
+        result[s, j] = complex(sin(seed + 0.31s + 0.47l + 0.83m),
+            m == 0 ? 0.0 : cos(seed - 0.27s + 0.19l - 0.41m)) / (l + 1)^2
+    end
+    return result
+end
+
+# Direct finite Wigner sum, independent of the Chebyshev table, local Euler
+# split, FFT and GPU recurrence. This oracle is deliberately restricted to l<=8.
+function hwp_test_wignerd(l, m, n, theta)
+    prefactor = sqrt(Float64(factorial(l+m) * factorial(l-m)) *
+                     Float64(factorial(l+n) * factorial(l-n)))
+    return sum((-1.0)^k * prefactor /
+        (Float64(factorial(l+m-k)) * factorial(k) * factorial(n-m+k) * factorial(l-n-k)) *
+        cos(theta/2)^(2l+m-n-2k) * sin(theta/2)^(n-m+2k)
+        for k in max(0,m-n):min(l+m,l-n))
+end
+
+function hwp_test_direct_tod(cp, rawsky, prepared, phi, theta, psi, eta)
+    sky = prepare_alm(cp, rawsky)
+    tod = zeros(ComplexF64, length(phi), cp.numofbeam)
+    for i in eachindex(phi), l in cp.lstart:cp.lstop
+        a = alm_slice(sky, l)
+        nmax = min(prepared.effective_bnmax, l)
+        for (mode, component) in zip(prepared.modes, prepared.components)
+            b = blm_slice(component, l)
+            modulation = Scanvolver._hwp_modulation(mode, eta[i])
+            for m in -l:l, n in -nmax:nmax
+                rotation = hwp_test_wignerd(l,m,n,theta[i]) * cis(m*phi[i]+n*psi[i]) * modulation
+                for s in 1:3, beam in 1:cp.numofbeam
+                    tod[i,beam] += (s == 1 ? 1.0 : 0.5) * a[s][1,m+l+1] *
+                        b[s][n+nmax+1,beam] * rotation
+                end
+            end
+        end
+    end
+    return tod
+end
+
+function hwp_test_scan(cp)
+    phi, theta, psi, eta = Float64[], Float64[], Float64[], Float64[]
+    pixels = Int[]
+    rings = [4, 7, 11]
+    for ring in rings
+        g = ring_geometry(cp, ring)
+        for position in (1, 3), hit in 1:16
+            push!(phi, g.phi_pixels[position] + 2e-4sin(0.7hit))
+            push!(theta, g.theta + 1e-4cos(0.9hit))
+            push!(psi, 0.43hit + 0.17position)
+            push!(eta, mod(0.71hit + 0.23position + 0.13ring, 2pi))
+            push!(pixels, g.first_pixel + position - 1)
+        end
+    end
+    return (; phi, theta, psi, eta, pixels, rings)
+end
+
+@testset "HWP phase transport and Fourier beams" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,
+                           HWP=true,HWP_rpm=46.)
+    scan = hwp_test_scan(cp)
+    buffer = build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi; hwp_angle=scan.eta)
+    @test length(buffer.hwp_angle) == length(scan.eta)
+    @test ring_scan_buffer_bytes(buffer) == sum(sizeof, (buffer.phi,buffer.theta,
+        buffer.psi,buffer.hwp_angle,buffer.pixel_offsets))
+    # Pixel bucketing must move the HWP phase with its original sample.
+    for j in eachindex(buffer.phi)
+        i = findfirst(k -> scan.phi[k] == buffer.phi[j] && scan.theta[k] == buffer.theta[j],eachindex(scan.phi))
+        @test buffer.hwp_angle[j] == scan.eta[i]
+    end
+    chunks = [(phi=scan.phi[r],theta=scan.theta[r],psi=scan.psi[r],time_array=Float64.(r))
+              for r in (1:31,32:length(scan.phi))]
+    timed = build_ring_scan_buffer(cp,chunks; hwp_phase_rad=0.37)
+    for j in eachindex(timed.phi)
+        i = findfirst(k -> scan.phi[k] == timed.phi[j] && scan.theta[k] == timed.theta[j],eachindex(scan.phi))
+        @test timed.hwp_angle[j] ≈ mod(2pi*46/60*i+0.37,2pi)
+    end
+    @test_throws ArgumentError build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi)
+    @test_throws ArgumentError build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi;hwp_angle=[NaN])
+    @test_throws ArgumentError build_ring_scan_buffer(ConvolutionParams(cp;HWP=false),
+        scan.phi,scan.theta,scan.psi;hwp_angle=scan.eta)
+    @test_throws ArgumentError prepare_hwp_blm(cp,zeros(3,28);mueller=zeros(3,3))
+    keyed=build_ring_scan_buffer(cp,[(hwp_angle=scan.eta,psi=scan.psi,theta=scan.theta,phi=scan.phi)])
+    @test keyed.hwp_angle == buffer.hwp_angle
+    @test keyed.phi == buffer.phi
+    raw = hwp_test_coefficients(6,0.2)
+    identity_beam = prepare_hwp_blm(cp,raw;mueller=Matrix{Float64}(I,4,4))
+    @test identity_beam.modes == [:constant]
+    ideal = prepare_hwp_blm(cp,raw)
+    @test ideal.modes == [:constant,:cos4,:sin4]
+    @test ideal.bnmax == 3
+    @test ideal.effective_bnmax == 6
+    tiny = copy(_HWP_IDEAL_TEST); tiny[1,2]=1e-25
+    @test :cos2 in prepare_hwp_blm(cp,raw;mueller=tiny).modes
+    for b in ideal.components, l in 0:6
+        blocks=blm_slice(b,l); nmax=min(b.bnmax,l)
+        for n in -nmax:nmax, s in 1:3
+            dual = s == 1 ? 1 : 5-s
+            @test blocks[s][-n+nmax+1,1] ≈ (-1.0)^n*conj(blocks[dual][n+nmax+1,1]) atol=1e-15
+        end
+    end
+end
+
+@testset "HWP nominal IQU and detector angle convention" begin
+    if CUDA.functional()
+        cp=ConvolutionParams(nside_output=4,lmax=6,lstop=6,HWP=true,HWP_rpm=0.)
+        g=ring_geometry(cp,7)
+        psi=[0.13+0.17i for i in 1:32]; eta=[0.27+0.39i for i in 1:32]
+        angle=Angles(cp;pix=g.first_pixel,φ=fill(g.phi_pixels[1],32),θ=fill(g.theta,32),ψ=psi,hwp_angle=eta)
+        chi=2 .* psi .+ 4 .* eta
+        truth=[1.7,0.3,-0.6]
+        signal=truth[1] .+ truth[2].*cos.(chi) .+ truth[3].*sin.(chi)
+        vals=reshape(ComplexF64[sum(signal)/32,sum(signal.*cis.(chi))/32],1,1,1,2)
+        gpu=CuArray(vals)
+        result=RingConvolution{Float64}(7,g.first_pixel,g.pixel_count,[1],[g.first_pixel],gpu)
+        @test vec(ring_stokes(result,[angle];rcond=1e-10)) ≈ truth atol=2e-14
+        CUDA.unsafe_free!(gpu)
+        offsets=[0.23,0.8]; weights=[1.0,2.0]
+        vals=zeros(ComplexF64,1,2,1,2)
+        for (j,offset) in enumerate(offsets)
+            chidet=chi .- 2offset
+            d=truth[1] .+ truth[2].*cos.(chidet) .+ truth[3].*sin.(chidet)
+            vals[1,j,1,1]=sum(d)/32
+            vals[1,j,1,2]=sum(d.*cis.(chi))/32
+        end
+        grouped=reduce_detector_accumulators(vals,offsets,weights;hwp=true)
+        @test vec(grouped_ring_stokes(grouped,[angle],offsets,weights;rcond=1e-10)) ≈ truth atol=2e-14
+    else
+        @test_skip CUDA.functional()
+    end
+end
+
+@testset "HWP CPU, direct GPU and GEMM moments" begin
+    cp=ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=4,HWP=true,HWP_rpm=0.)
+    scan=hwp_test_scan(cp)
+    buffer=build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi;hwp_angle=scan.eta)
+    plan=automatic_scan_plan(ConvolutionParams(cp;HWP=false);beta_order=8,precision=Float64)
+    if CUDA.functional()
+        active,angles=make_ring_angles(cp,ring_geometry(cp,7),buffer)
+        for mode in Scanvolver._HWP_MODES
+            direct=scan_moments_direct_gpu(plan,angles;hwp_mode=mode,demodulate_hwp=true)
+            gemm=scan_moments_gemm_gpu(plan,angles;hwp_mode=mode,demodulate_hwp=true)
+            cpu=cat([reshape(scan_moments_cpu(plan,a;hwp_mode=mode,demodulate_hwp=true),2,8,9,7,1)
+                     for a in angles]...;dims=5)
+            @test Array(direct) ≈ cpu atol=2e-14 rtol=2e-13
+            @test Array(gemm) ≈ cpu atol=2e-14 rtol=2e-13
+            for (j,a) in enumerate(angles)
+                expected=sum(Scanvolver._hwp_modulation(mode,a.η[i])*cis(2a.ψ[i]+4a.η[i]) for i in 1:a.num)/a.num
+                @test cpu[2,1,5,4,j] ≈ expected atol=2e-14
+            end
+            foreach(CUDA.unsafe_free!,(direct,gemm))
+        end
+        CUDA.unsafe_free!(active.positions)
+    else
+        @test_skip CUDA.functional()
+    end
+end
+
+@testset "HWP pipeline against direct Wigner sums" begin
+    if CUDA.functional()
+        cp=ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,
+                             numofbeam=2,HWP=true,HWP_rpm=0.)
+        scan=hwp_test_scan(cp)
+        rawsky=hwp_test_coefficients(6,0.9)
+        rawbeams=[hwp_test_coefficients(6,0.2),hwp_test_coefficients(6,0.7)]
+        sky=prepare_alm(cp,rawsky)
+        buffer=build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi;hwp_angle=scan.eta)
+        cases=[("identity",Matrix{Float64}(I,4,4)),("ideal",_HWP_IDEAL_TEST),
+               ("random",_HWP_IDEAL_TEST .+ [0.03sin(0.7i+0.4j) for i in 1:4,j in 1:4])]
+        mktempdir() do dir
+            for (label,M) in cases
+                beams=prepare_hwp_blm(cp,rawbeams;mueller=M)
+                tod=hwp_test_direct_tod(cp,rawsky,beams,scan.phi,scan.theta,scan.psi,scan.eta)
+                @test maximum(abs,imag.(tod)) < 1e-12maximum(abs,tod)
+                expected=fill(NaN,cp.resol.numOfPixels,3,2,1)
+                for pixel in unique(scan.pixels)
+                    ids=findall(==(pixel),scan.pixels)
+                    chi=2 .* scan.psi[ids] .+ 4 .* scan.eta[ids]
+                    A=hcat(ones(length(ids)),cos.(chi),sin.(chi))
+                    for beam in 1:2
+                        expected[pixel,:,beam,1]=A\real.(tod[ids,beam])
+                    end
+                end
+                target=joinpath(dir,label*".h5")
+                convolve_to_hdf5(cp,buffer,sky,beams;output_path=target,
+                    rings=scan.rings,beam_batch_size=1,beta_order=12,l_tile=3,rcond=1e-10)
+                h5open(target,"r") do f
+                    actual=read(f["map"])
+                    @test actual[unique(scan.pixels),:,:,:] ≈ expected[unique(scan.pixels),:,:,:] atol=3e-11 rtol=3e-10
+                    @test read(attributes(f)["hwp_demodulation"]) == "2psi+4eta"
+                    @test read(f["hwp_mueller_iquv"]) == M
+                end
+                if label == "random"
+                    offsets=[0.23,0.8]; weights=[1.0,2.0]
+                    group_target=joinpath(dir,"grouped.h5")
+                    convolve_detector_groups_to_hdf5(cp,buffer,sky,beams;
+                        output_path=group_target,rings=scan.rings,beta_order=12,l_tile=2,
+                        detector_labels=["a","b"],detector_offsets=offsets,
+                        detector_weights=weights,rcond=1e-10)
+                    grouped=h5open(f->read(f["map"]),group_target,"r")
+                    for pixel in unique(scan.pixels)
+                        ids=findall(==(pixel),scan.pixels)
+                        chi=2 .* scan.psi[ids] .+ 4 .* scan.eta[ids]
+                        normal=zeros(3,3); rhs=zeros(3)
+                        for beam in 1:2
+                            A=hcat(ones(length(ids)),cos.(chi .- 2offsets[beam]),sin.(chi .- 2offsets[beam]))
+                            normal .+= weights[beam] .* (A' * A)
+                            rhs .+= weights[beam] .* (A' * real.(tod[ids,beam]))
+                        end
+                        @test grouped[pixel,:,1,1] ≈ normal\rhs atol=3e-11 rtol=3e-10
+                    end
+                    single_target=joinpath(dir,"float32_direct.h5")
+                    devices=length(CUDA.devices())>=2 && Threads.nthreads()>=2 ? [0,1] : [0]
+                    convolve_to_hdf5(cp,buffer,prepare_alm(cp,rawsky;precision=Float32),
+                        prepare_hwp_blm(cp,rawbeams;mueller=M,precision=Float32);
+                        output_path=single_target,rings=scan.rings,beam_batch_size=2,
+                        devices,beta_order=12,l_tile=2,rcond=1e-10,moment_method=:direct)
+                    single=h5open(f->read(f["map"]),single_target,"r")
+                    @test single[unique(scan.pixels),:,:,:] ≈ expected[unique(scan.pixels),:,:,:] atol=2e-7 rtol=1e-5
+                end
+                # Optional out-of-repository fixture for an external LBS oracle.
+                fixture_dir=get(ENV,"SCANVOLVER_HWP_FIXTURES","")
+                if !isempty(fixture_dir)
+                    mkpath(fixture_dir)
+                    h5open(joinpath(fixture_dir,label*"_fixture.h5"),"w") do f
+                        f["sky"]=rawsky; f["beam1"]=rawbeams[1]; f["beam2"]=rawbeams[2]
+                        f["mueller"]=M; f["phi"]=scan.phi; f["theta"]=scan.theta
+                        f["psi"]=scan.psi; f["eta"]=scan.eta; f["pixels"]=scan.pixels
+                        f["tod"]=tod; f["expected_maps"]=expected
+                        f["actual_maps"]=h5open(x->read(x["map"]),target,"r")
+                        attributes(f)["lmax"]=6; attributes(f)["bnmax"]=3
+                    end
+                end
+            end
+        end
+    else
+        @test_skip CUDA.functional()
+    end
+end
+
+function lowell_test_beam(lmax, seed)
+    raw = hwp_test_coefficients(lmax, seed)
+    raw[1,1] = 1/sqrt(4pi)
+    raw[1,2] = .07
+    raw[1,lmax+2] = .03+.02im
+    return raw
+end
+
+function lowell_test_moments(raw, lmax, bnmax)
+    # Independent finite-band I,Q,U synthesis and beam-surface integration.
+    # No effective-beam or Gaunt helper is used by this oracle.
+    nodes = eigen(SymTridiagonal(zeros(32), [j/sqrt(4j^2-1) for j in 1:31]))
+    mean, moment = zeros(3), zeros(3,3)
+    for j in eachindex(nodes.values), i in 0:39
+        theta, phi = acos(nodes.values[j]), 2pi*i/40
+        intensity, p = 0.0im, 0.0im
+        for l in 0:lmax, m in -min(bnmax,l):min(bnmax,l)
+            index = Scanvolver._packed_alm_index(l, abs(m), lmax)
+            b0 = raw[1,index]
+            plus, minus = -(raw[2,index]+im*raw[3,index]), -(raw[2,index]-im*raw[3,index])
+            if m < 0
+                b0 = (-1.0)^m*conj(b0)
+                plus = (-1.0)^m*conj(minus)
+            end
+            norm = sqrt((2l+1)/(4pi))*cis(m*phi)
+            intensity += b0*norm*hwp_test_wignerd(l,m,0,theta)
+            l >= 2 && (p += plus*norm*hwp_test_wignerd(l,m,-2,theta))
+        end
+        p *= cis(2phi) # spherical polarization -> Ludwig-3.
+        response = [real(intensity), real(p), imag(p)]
+        xyz = [sin(theta)*cos(phi), sin(theta)*sin(phi), cos(theta)]
+        area = 2*nodes.vectors[1,j]^2 * (2pi/40)
+        mean .+= area .* response
+        moment .+= area .* (response*xyz')
+    end
+    return mean, moment
+end
+
+function lowell_test_reference(raw, cp, mono, dipole, matrix, phi, theta, psi, eta)
+    mean, moment = lowell_test_moments(raw, cp.lmax, cp.bnmax)
+    output = zeros(length(phi))
+    vx, vy, vz = dipole
+    for i in eachindex(phi)
+        dx = cos(theta[i])*(cos(phi[i])*vx+sin(phi[i])*vy)-sin(theta[i])*vz
+        dy = -sin(phi[i])*vx+cos(phi[i])*vy
+        dz = sin(theta[i])*(cos(phi[i])*vx+sin(phi[i])*vy)+cos(theta[i])*vz
+        local_d = [cos(psi[i])*dx+sin(psi[i])*dy,
+                   -sin(psi[i])*dx+cos(psi[i])*dy, dz]
+        integrals = mono*mean + moment*local_d
+        c, s = cos(2eta[i]), sin(2eta[i])
+        output[i] = integrals[1]*matrix[1,1] +
+            integrals[2]*(c*matrix[2,1]-s*matrix[3,1]) +
+            integrals[3]*(s*matrix[2,1]+c*matrix[3,1])
+    end
+    return output
+end
+
+function lowell_test_same(a, b; first_l=a.lstart)
+    return a.modes == b.modes && all(
+        blm_slice(x,l) == blm_slice(y,l)
+        for (x,y) in zip(a.components,b.components) for l in first_l:a.lstop)
+end
+
+@testset "Low-ell HWP against independent real-space TOD and maps" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,
+                           numofbeam=2,HWP=true,HWP_rpm=0.)
+    mono, dipole = .7, [.31,-.22,.17]
+    sky = zeros(ComplexF64,3,28)
+    sky[1,1] = mono*sqrt(4pi)
+    sky[1,2] = dipole[3]*sqrt(4pi/3)
+    sky[1,8] = -(dipole[1]-im*dipole[2])*sqrt(2pi/3)
+    beams = [lowell_test_beam(6,.2), lowell_test_beam(6,.7)]
+    beams[2][1,:] .= 0 # P-only diagnostic in the same multi-beam call.
+    # A rotated passive HWP exercises both M_QI and M_UI.
+    c, s = cos(.46), sin(.46)
+    rotation = [1. 0 0 0; 0 c s 0; 0 -s c 0; 0 0 0 1]
+    g = sqrt(.99*.97)
+    matrix = rotation' * [.98 .01 0 0; .01 .98 0 0; 0 0 -g 0; 0 0 0 -g] * rotation
+    prepared = prepare_hwp_blm(cp,beams;mueller=matrix,lowell_hwp=:full_sum)
+    phi, theta, psi, eta = Float64[], Float64[], Float64[], Float64[]
+    pixels = Int[]
+    for ring in (4,7,11), position in (1,3), hit in 1:24
+        geometry = ring_geometry(cp,ring)
+        push!(phi,geometry.phi_pixels[position]); push!(theta,geometry.theta)
+        push!(psi,.43hit+.17position); push!(eta,.71hit+.23position+.13ring)
+        push!(pixels,geometry.first_pixel+position-1)
+    end
+    actual = hwp_test_direct_tod(cp,sky,prepared,phi,theta,psi,eta)
+    reference = hcat([lowell_test_reference(beam,cp,mono,dipole,matrix,phi,theta,psi,eta) for beam in beams]...)
+    @test maximum(abs,imag.(actual)) < 1e-14
+    @test real.(actual) ≈ reference atol=2e-12 rtol=2e-11
+    @test maximum(abs,real.(actual[:,2])) > 1e-5
+    ids = unique(pixels)
+    angles = Angles[]
+    moments = zeros(ComplexF64,1,2,length(ids),2)
+    expected = zeros(length(ids),3,2)
+    for (j,pixel) in enumerate(ids)
+        keep = findall(==(pixel),pixels)
+        push!(angles,Angles(cp;pix=pixel,φ=phi[keep],θ=theta[keep],ψ=psi[keep],hwp_angle=eta[keep]))
+        chi = 2psi[keep]+4eta[keep]
+        design = hcat(ones(length(keep)),cos.(chi),sin.(chi))
+        expected[j,:,:] = design \ reference[keep,:]
+        for beam in 1:2
+            moments[1,beam,j,1] = sum(actual[keep,beam])/length(keep)
+            moments[1,beam,j,2] = sum(actual[keep,beam].*cis.(chi))/length(keep)
+        end
+    end
+    mapped = grouped_ring_stokes(moments,angles,[0.],[1.];rcond=1e-10)
+    @test mapped[1,:,:,:] ≈ permutedims(expected,(3,2,1)) atol=2e-12 rtol=2e-11
+    if CUDA.functional()
+        buffer = build_ring_scan_buffer(cp,phi,theta,psi;hwp_angle=eta)
+        mktempdir() do dir
+            target = joinpath(dir,"lowell.h5")
+            convolve_to_hdf5(cp,buffer,prepare_alm(cp,sky),prepared;output_path=target,
+                rings=[4,7,11],beam_batch_size=1,beta_order=12,l_tile=3,rcond=1e-10)
+            h5open(target,"r") do file
+                @test read(file["map"])[ids,:,:,1] ≈ expected atol=3e-11 rtol=3e-10
+                @test read(attributes(file)["hwp_lowell"]) == "full_sum"
+            end
+        end
+    else
+        @test_skip CUDA.functional()
+    end
+end
+
+@testset "Low-ell scope, layout, truncation and precision" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,HWP=true,HWP_rpm=0.)
+    raw = lowell_test_beam(6,.2)
+    matrix = [.98 .01 0 0; .01 .98 0 0; 0 0 -.97 0; 0 0 0 -.97]
+    shifted = prepare_hwp_blm(cp,raw;mueller=matrix)
+    full = prepare_hwp_blm(cp,raw;mueller=matrix,lowell_hwp=:full_sum)
+    @test lowell_test_same(shifted,prepare_hwp_blm(cp,raw;mueller=matrix,lowell_hwp=:shifted))
+    @test lowell_test_same(shifted,full;first_l=2)
+    @test all(all(iszero,blm_slice(component,l)[s]) for component in full.components for l in 0:1 for s in 2:3)
+    for M in (Matrix{Float64}(I,4,4), [1. 0 .02 0; 0 1 0 0; 0 0 -1 0; 0 0 0 -1])
+        @test lowell_test_same(prepare_hwp_blm(cp,raw;mueller=M),prepare_hwp_blm(cp,raw;mueller=M,lowell_hwp=:full_sum))
+    end
+    limited = prepare_hwp_blm(ConvolutionParams(cp;lstop=1),raw;mueller=matrix,lowell_hwp=:full_sum)
+    @test all(blm_slice(a,l)==blm_slice(b,l) for (a,b) in zip(full.components,limited.components) for l in 0:1)
+    spin = copy(raw)
+    spin[2,:] = -(raw[2,:]+im*raw[3,:]); spin[3,:] = -(raw[2,:]-im*raw[3,:])
+    @test lowell_test_same(full,prepare_hwp_blm(cp,spin;mueller=matrix,input_basis=:spin,lowell_hwp=:full_sum))
+    single = prepare_hwp_blm(cp,raw;mueller=matrix,precision=Float32,lowell_hwp=:full_sum)
+    @test all(isapprox(blm_slice(a,l)[1],blm_slice(b,l)[1];atol=1e-8,rtol=1e-6)
+              for (a,b) in zip(full.components,single.components) for l in 0:6)
+    @test only(beam_batches(full,1)).blm.lowell_hwp === :full_sum
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;lowell_hwp=:invalid)
+    @test Scanvolver._hwp_lowell_weights(0,0,2,4)[3] ≈ sqrt(5)/3 atol=1e-15
+end
