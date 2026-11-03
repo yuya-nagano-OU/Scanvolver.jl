@@ -48,6 +48,10 @@ function make_writer(file, layout, cp, plan, rings, T, map_precision, devices,
     attrs["pixel_ordering"] = "RING"
     attrs["pixel_index_base"] = 1
     attrs["stokes_order"] = "I,Q,U"
+    if cp.HWP
+        attrs["HWP"] = true
+        attrs["HWP_rpm"] = cp.HWP_rpm
+    end
     attrs["compute_precision"] = string(T)
     attrs["map_precision"] = string(map_precision)
     attrs["ebcodecmb_source"] = pathof(Scanvolver)

@@ -61,7 +61,8 @@ The default `1e-2` is intentionally conservative for production maps; pass a
 smaller value explicitly only when retaining poorly conditioned pixels is
 useful for diagnostics.
 
-The system depends only on `psi`, so it is factorized once per pixel and reused
+For HWP angles the same equations use `psi+2eta`, both for the sufficient
+statistics and the normal matrix. The system is factorized once per pixel and reused
 by every sky and beam. One ring is the bounded form of the result: at nside 512
 a full-sky map for 22 skies and 100 beams is about 83 GB in Float32, while one
 ring of it is a few MB, so the HDF5 pipelines write each ring as it is solved.
@@ -101,8 +102,8 @@ function ring_stokes(
         angle.num == 0 && continue
 
         inverse_hits = 1.0 / angle.num
-        h2 = inverse_hits * sum(cis(2 * psi) for psi in angle.ψ)
-        h4 = inverse_hits * sum(cis(4 * psi) for psi in angle.ψ)
+        h2 = inverse_hits * sum(cis(2 * _nominal_pol_angle(angle, i)) for i in 1:angle.num)
+        h4 = inverse_hits * sum(cis(4 * _nominal_pol_angle(angle, i)) for i in 1:angle.num)
         h_matrix = ComplexF64[
             1.0              0.5*conj(h2)     0.5*h2
             0.5*h2           0.25             0.25*h4

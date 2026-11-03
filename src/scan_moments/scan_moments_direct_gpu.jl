@@ -5,6 +5,7 @@ struct _PackedScanMomentAngles{T<:_CHEBYSHEV_PRECISIONS}
     beta::CuVector{T}
     gamma::CuVector{T}
     psi::CuVector{T}
+    modulation::Union{Nothing,CuVector{T}}
     offsets::CuVector{Int32}
     pixel_count::Int32
 end
@@ -16,7 +17,9 @@ end
 
 function _PackedScanMomentAngles(
     angles::AbstractVector{<:Angles},
-    ::Type{T},
+    ::Type{T};
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     isempty(angles) && throw(ArgumentError(
         "angles must contain at least one pixel",
@@ -29,11 +32,13 @@ function _PackedScanMomentAngles(
         "packed angle batch exceeds Int32 indexing",
     ))
     total_hits = Int(total_hits_wide)
+    _check_hwp_moment_inputs(angles, hwp_mode, demodulate_hwp)
 
     alpha = Vector{T}(undef, total_hits)
     beta = Vector{T}(undef, total_hits)
     gamma = Vector{T}(undef, total_hits)
     psi = Vector{T}(undef, total_hits)
+    modulation = hwp_mode === :constant ? nothing : Vector{T}(undef, total_hits)
     offsets = Vector{Int32}(undef, length(angles) + 1)
     offsets[1] = Int32(1)
 
@@ -45,7 +50,11 @@ function _PackedScanMomentAngles(
         alpha[destination] .= T.(angle.α)
         beta[destination] .= T.(angle.β)
         gamma[destination] .= T.(angle.γ)
-        psi[destination] .= T.(angle.ψ)
+        psi[destination] .= demodulate_hwp ?
+            T[_nominal_pol_angle(angle, i) for i in 1:angle.num] : T.(angle.ψ)
+        if modulation !== nothing
+            modulation[destination] .= T.(_hwp_modulation.(hwp_mode, angle.η))
+        end
         position += hit_count
         offsets[pixel_index + 1] = Int32(position)
     end
@@ -54,6 +63,7 @@ function _PackedScanMomentAngles(
     beta_device = nothing
     gamma_device = nothing
     psi_device = nothing
+    modulation_device = nothing
     offsets_device = nothing
     completed = false
     try
@@ -61,12 +71,14 @@ function _PackedScanMomentAngles(
         beta_device = CuArray(beta)
         gamma_device = CuArray(gamma)
         psi_device = CuArray(psi)
+        modulation_device = modulation === nothing ? nothing : CuArray(modulation)
         offsets_device = CuArray(offsets)
         packed = _PackedScanMomentAngles{T}(
             alpha_device,
             beta_device,
             gamma_device,
             psi_device,
+            modulation_device,
             offsets_device,
             Int32(length(angles)),
         )
@@ -78,6 +90,7 @@ function _PackedScanMomentAngles(
             _unsafe_free_if_allocated(beta_device)
             _unsafe_free_if_allocated(gamma_device)
             _unsafe_free_if_allocated(psi_device)
+            _unsafe_free_if_allocated(modulation_device)
             _unsafe_free_if_allocated(offsets_device)
         end
     end
@@ -90,6 +103,7 @@ function _free_packed_scan_moment_angles!(
     CUDA.unsafe_free!(packed.beta)
     CUDA.unsafe_free!(packed.gamma)
     CUDA.unsafe_free!(packed.psi)
+    _unsafe_free_if_allocated(packed.modulation)
     CUDA.unsafe_free!(packed.offsets)
     return nothing
 end
@@ -121,6 +135,7 @@ function _scan_moments_direct_kernel!(
     beta,
     gamma,
     psi,
+    modulation,
     offsets,
     beta_order::Int32,
     q_count::Int32,
@@ -167,7 +182,7 @@ function _scan_moments_direct_kernel!(
         )
         weight =
             _scan_moment_chebyshev_value(beta_mode, x) *
-            inverse_hits
+            inverse_hits * _sample_modulation(modulation, hit_index, T)
         spin0 += weight * spin0_phase
         spin2 +=
             weight * spin0_phase *
@@ -224,7 +239,9 @@ separate.
 """
 function scan_moments_direct_gpu(
     plan::ScanMomentPlan{T},
-    angles::AbstractVector{<:Angles},
+    angles::AbstractVector{<:Angles};
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     CUDA.functional() || throw(ArgumentError(
         "CUDA.jl is loaded but no functional GPU is available",
@@ -234,7 +251,7 @@ function scan_moments_direct_gpu(
     end
     q_count, n_count, total =
         _check_scan_moment_gpu_dimensions(plan, length(angles))
-    packed = _PackedScanMomentAngles(angles, T)
+    packed = _PackedScanMomentAngles(angles, T; hwp_mode, demodulate_hwp)
     output = CUDA.zeros(
         Complex{T},
         2,
@@ -252,6 +269,7 @@ function scan_moments_direct_gpu(
             packed.beta,
             packed.gamma,
             packed.psi,
+            packed.modulation,
             packed.offsets,
             Int32(plan.beta_order),
             Int32(q_count),
