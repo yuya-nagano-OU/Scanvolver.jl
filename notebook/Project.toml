@@ -8,11 +8,12 @@ Printf = "de0858da-6303-5e67-8744-51eddeeeb8d7"
 Scanvolver = "531fa2f8-6a2c-4c10-848b-a0fe9acf498e"
 
 [sources]
+Falcons = {url = "https://github.com/yusuke-takase/Falcons.jl", rev = "3a1fb5b6933b230423b4f856c40fa7a54b0f8dbc"}
 Scanvolver = {path = ".."}
 
 [compat]
-CUDA = "5, 6"
-Falcons = "1.0.1"
+CUDA = "5"
+Falcons = "=1.0.2"
 HDF5 = "0.17"
 IJulia = "1"
 Plots = "1"
