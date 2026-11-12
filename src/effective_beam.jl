@@ -374,6 +374,11 @@ the conjugation required by the convolution convention.
 The returned layout is
 `E[(spin,M,l), beam, pixel, scan_weight]`. Within the first axis spin varies
 fastest in the order `(0,+2,-2)`, followed by signed `M`, then `l`.
+
+With `spin_reduction=true`, return real coefficients folded against the
+independent real sky modes, with layout `(term,2*beam,pixel,scan_weight)`.
+The two beam channels are real/imaginary output components; both helicities
+and both scan weights are retained in this folding.
 """
 function apply_beams_gemm_gpu(
     table::_CuWignerChebyshevTable{T},
@@ -383,6 +388,7 @@ function apply_beams_gemm_gpu(
     l_last::Integer,
     ;
     timing_callback=nothing,
+    spin_reduction::Bool=false,
 ) where {T<:_GPU_RECURSION_PRECISIONS}
     first_l = Int(l_first)
     last_l = Int(l_last)
@@ -480,9 +486,9 @@ function apply_beams_gemm_gpu(
         packed_blm = nothing
 
         output = CUDA.zeros(
-            Complex{T},
+            spin_reduction ? T : Complex{T},
             term_count,
-            beam_count,
+            spin_reduction ? 2beam_count : beam_count,
             pixel_count,
             2,
         )
@@ -510,18 +516,21 @@ function apply_beams_gemm_gpu(
                     beta,
                     gemm_output,
                 )
-                @cuda threads=_EFFECTIVE_BEAM_THREADS blocks=cld(
-                    Int(per_scan_total),
-                    _EFFECTIVE_BEAM_THREADS,
-                ) _pack_effective_beam_output_kernel!(
-                    output,
-                    gemm_output,
-                    Int32(scan_weight),
-                    Int32(M_count),
-                    Int32(pixel_count),
-                    Int32(beam_count),
-                    Int32(batch_count),
-                )
+                if spin_reduction
+                    @cuda threads=_EFFECTIVE_BEAM_THREADS blocks=cld(
+                        Int(per_scan_total), _EFFECTIVE_BEAM_THREADS,
+                    ) _pack_spin_reduced_effective_kernel!(
+                        output, gemm_output, Int32(scan_weight), Int32(M_count),
+                        Int32(pixel_count), Int32(beam_count), Int32(batch_count),
+                    )
+                else
+                    @cuda threads=_EFFECTIVE_BEAM_THREADS blocks=cld(
+                        Int(per_scan_total), _EFFECTIVE_BEAM_THREADS,
+                    ) _pack_effective_beam_output_kernel!(
+                        output, gemm_output, Int32(scan_weight), Int32(M_count),
+                        Int32(pixel_count), Int32(beam_count), Int32(batch_count),
+                    )
+                end
                 CUDA.synchronize()
             finally
                 gemm_output === nothing || begin

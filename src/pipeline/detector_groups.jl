@@ -195,7 +195,7 @@ function convolve_detector_groups_to_hdf5(
     beta_order::Integer=8, l_tile=:auto, max_l_tile::Integer=32,
     memory_fraction::Real=0.7, moment_method::Symbol=:gemm,
     map_precision::Type=T, rcond::Real=1e-2, unseen::Real=NaN,
-    reclaim_interval::Integer=16,
+    reclaim_interval::Integer=16, spin_reduction::Symbol=:auto,
     sky_ids=string.(1:cp.numofsky),
     input_beam_ids=string.(1:cp.numofbeam),
     group_ids=string.(1:(cp.numofbeam ÷ length(detector_offsets))),
@@ -239,7 +239,7 @@ function convolve_detector_groups_to_hdf5(
         layout, cp, buffer, alm, blm, batches, path, ring_list, device_list;
         beta_order, l_tile, max_l_tile, memory_fraction, moment_method, map_precision,
         rcond, unseen, reclaim_interval, sky_ids, metadata, batch_callback,
-        progress_callback)
+        progress_callback, spin_reduction)
 end
 
 """Read a completed ring as `(sky, detector_group, I/Q/U, ring_pixel)`."""

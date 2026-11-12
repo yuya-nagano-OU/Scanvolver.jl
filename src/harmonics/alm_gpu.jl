@@ -2,7 +2,7 @@
     GPUAlm{T}
 
 Sky harmonic coefficients resident on one CUDA device. `values` has layout
-`values[m_index, spin, sky, l_index]`, where spin is ordered `(0,+2,-2)`.
+`values[m_index, spin, sky, l_index]`, where spin is ordered `(0,+2,-2)`, or `(0,+2)` with `spin_reduction=true`.
 For each `l`, the valid leading part of the first axis is `m=-l:l`; the
 remaining padded entries are zero.
 """
@@ -49,15 +49,18 @@ function _check_prepared_alm_for_upload(alm::PreparedAlm)
 end
 
 """
-    upload_alm_gpu(prepared_alm; device_id=nothing) -> GPUAlm
+    upload_alm_gpu(prepared_alm; device_id=nothing, spin_reduction=false) -> GPUAlm
 
 Pack ragged, host-resident `PreparedAlm` slices into one contiguous CUDA
 array. The result is independent of the scan ring and can be reused for all
-rings and all `l` tiles on the selected device.
+rings and all `l` tiles on the selected device. `spin_reduction=true` checks
+the exact real-Stokes relations and uploads only `(0,+2)`; subsequent sky
+tiles use the independent real representation described in `docs/spin_reduction.md`.
 """
 function upload_alm_gpu(
     alm::PreparedAlm{T};
     device_id::Union{Nothing,Integer}=nothing,
+    spin_reduction::Bool=false,
 ) where {T<:_HARMONIC_PRECISIONS}
     _check_prepared_alm_for_upload(alm)
     CUDA.functional() || throw(ArgumentError(
@@ -65,18 +68,22 @@ function upload_alm_gpu(
     ))
     device_id === nothing || CUDA.device!(Int(device_id))
 
+    spin_reduction && !_alm_has_spin_reality(alm) && throw(ArgumentError(
+        "spin reduction requires real-Stokes sky coefficients, including m=0",
+    ))
+    spin_count = spin_reduction ? 2 : 3
     l_count = alm.lstop - alm.lstart + 1
     packed = zeros(
         Complex{T},
         2 * alm.lstop + 1,
-        3,
+        spin_count,
         alm.numofsky,
         l_count,
     )
     for (l_index, l) in enumerate(alm.lstart:alm.lstop)
         blocks = alm_slice(alm, l)
         m_count = 2 * l + 1
-        for spin_index in 1:3
+        for spin_index in 1:spin_count
             @views packed[
                 1:m_count,
                 spin_index,

@@ -13,11 +13,11 @@ function check_beta(angles, plan, ring)
     return observed
 end
 
-function prepare_context(cp, alm, table, device, T)
+function prepare_context(cp, alm, table, device, T; spin_reduction=false)
     CUDA.device!(device)
     device_alm = device_table = context = nothing
     try
-        device_alm = upload_alm_gpu(alm)
+        device_alm = upload_alm_gpu(alm; spin_reduction)
         device_table = upload_wigner_table_gpu(table)
         context = ringd_context(cp; precision=T)
         CUDA.synchronize()
@@ -125,7 +125,8 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
         end
         cp_batch = ConvolutionParams(geometry_cp; numofbeam=maximum(length(b.indices) for b in batches))
         width, tile_bytes = select_tile(cp_batch, geometry, active, T, l_tile,
-                                        max_l_tile, memory_fraction)
+                                        max_l_tile, memory_fraction;
+                                        spin_reduction=size(context.alm.values,2)==2)
         tile_count = 0
         for l_first in cp.lstart:width:cp.lstop
             l_last = min(l_first + width - 1, cp.lstop)
@@ -145,7 +146,8 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
                             effective = nothing
                             try
                                 effective = apply_beams_gemm_gpu(context.table, kernel,
-                                    _beam_component(batch.blm, j), l_first, l_last)
+                                    _beam_component(batch.blm, j), l_first, l_last;
+                                    spin_reduction=active_sky isa _SpinReducedSkyRing)
                                 accumulate_convolution_tile_gemm_gpu!(accumulator, active_sky, effective)
                             finally
                                 effective === nothing || CUDA.unsafe_free!(effective)
@@ -237,7 +239,9 @@ Persistent device contexts consume a dynamic ring queue.
 function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, ring_list,
                    device_list; beta_order, l_tile, max_l_tile, memory_fraction,
                    moment_method, map_precision, rcond, unseen, reclaim_interval,
-                   sky_ids, metadata, batch_callback, progress_callback) where {T}
+                   sky_ids, metadata, batch_callback, progress_callback,
+                   spin_reduction::Symbol=:auto) where {T}
+    reduce_spin = _resolve_spin_reduction(alm, spin_reduction)
     geometry_cp = _geometry_params(cp, blm)
     plan = automatic_scan_plan(geometry_cp; beta_order, precision=T)
     table = build_wigner_chebyshev_table_cpu(geometry_cp, plan)
@@ -245,13 +249,18 @@ function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, 
     try
         # Serial first-use CUDA setup avoids concurrent context initialization.
         for device in device_list
-            push!(contexts, prepare_context(geometry_cp, alm, table, device, T))
+            push!(contexts, prepare_context(geometry_cp, alm, table, device, T;
+                                           spin_reduction=reduce_spin))
         end
         h5open(path, "w") do file
             writer = make_writer(file, layout, cp, plan, ring_list, T, map_precision,
                                  device_list, sky_ids, metadata,
                                  (; rcond, unseen, l_tile, max_l_tile, memory_fraction,
                                     moment_method))
+            attributes(file)["spin_reduction"] = reduce_spin
+            attributes(file)["spin_reduction_requested"] = string(spin_reduction)
+            attributes(file)["sky_ring_representation"] = reduce_spin ?
+                "independent_real_stokes" : "full_complex_0_plus2_minus2"
             if blm isa PreparedHWPBlm
                 attributes(file)["hwp_angle_frame"] = "beam focal plane"
                 attributes(file)["hwp_demodulation"] = "2psi+4eta"
@@ -315,6 +324,10 @@ span all beams. Shared K/U are built once per l tile, not per beam batch.
 The output file is created only when `output_path` does not exist. Failures
 propagate after every GPU worker has joined; completed rings remain recorded
 in the partial file. This version records progress but does not auto-resume.
+`spin_reduction=:auto` uses independent real Stokes modes when their exact
+reality relations hold. `:on` requires them and `:off` selects the previous
+full-complex path. HDF5 attributes record the actual choice.
+
 Callbacks run serially; batch_callback receives a borrowed, ring-local CPU
 array after writing it, before that ring is marked complete. No full map is
 allocated or returned. Returns the absolute output path.
@@ -326,7 +339,7 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
                          beta_order::Integer=8, l_tile=:auto, max_l_tile::Integer=32,
                          memory_fraction::Real=0.7, moment_method::Symbol=:gemm,
                          map_precision::Type=T, rcond::Real=1e-2, unseen::Real=NaN,
-                         reclaim_interval::Integer=16,
+                         reclaim_interval::Integer=16, spin_reduction::Symbol=:auto,
                          sky_ids=string.(1:cp.numofsky), beam_ids=string.(1:cp.numofbeam),
                          metadata=Dict{String,Any}(), beam_metadata=Dict{String,Any}(),
                          batch_callback=nothing, progress_callback=nothing) where {T}
@@ -343,5 +356,5 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
     return run_rings(layout, cp, buffer, alm, blm, beam_batches(blm, beam_batch_size), path,
                      ring_list, device_list; beta_order, l_tile, max_l_tile, memory_fraction,
                      moment_method, map_precision, rcond, unseen, reclaim_interval, sky_ids,
-                     metadata, batch_callback, progress_callback)
+                     metadata, batch_callback, progress_callback, spin_reduction)
 end

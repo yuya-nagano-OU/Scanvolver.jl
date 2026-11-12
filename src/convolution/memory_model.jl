@@ -1,7 +1,7 @@
 """
     ring_memory_bytes(
         cp, ring_pixel_count, active_count, l_tile;
-        precision=Float64, complete_ring=false,
+        precision=Float64, complete_ring=false, spin_reduction=false,
     ) -> NamedTuple
 
 Device bytes that one ring of the convolution needs, split into the parts
@@ -9,7 +9,7 @@ that live for the whole ring and the parts that live for one `l` tile.
 
 Fields: `ringd_plan`, `ringd`, `accumulated`, `persistent`;
 `effective_kernel`, `beam_workspace`, `effective_beam`, `sky_ring`,
-`active_sky_ring`, `tile_peak`; and `total = persistent + tile_peak`.
+`active_sky_ring`, `sky_fft`, `contraction_workspace`, `tile_peak`; and `total = persistent + tile_peak`.
 
 Scan moments are **not** included: they are already resident when the tiles are
 sized, and `scan_moments_gemm_memory_bytes` estimates them separately. Neither
@@ -21,7 +21,8 @@ effective beam, where the compact kernel, the beam matrices, the beam GEMM
 output and the effective beam are all live at once, and contracting, where the
 effective beam, the full-ring sky tile and its gathered copy are live. The
 gathered copy is free on a complete ring, where `select_active_sky_ring_gpu`
-returns its input.
+returns its input. With `spin_reduction=true`, also account for the
+transient independent-mode FFT buffer and real-GEMM output workspace.
 """
 function ring_memory_bytes(
     cp::ConvolutionParams,
@@ -30,6 +31,7 @@ function ring_memory_bytes(
     l_tile::Integer;
     precision::Type=Float64,
     complete_ring::Bool=false,
+    spin_reduction::Bool=false,
 )
     precision in (Float32, Float64) || throw(ArgumentError(
         "precision must be Float32 or Float64, got $precision",
@@ -77,14 +79,19 @@ function ring_memory_bytes(
     effective_beam = term_count * beams * Int128(actives) * 2 * complex_bytes
     beam_workspace = max(packed_blm, beam_matrices + gemm_output)
 
-    sky_ring = skies * term_count * Int128(ring_pixels) * complex_bytes
+    sky_bytes = spin_reduction ? real_bytes : complex_bytes
+    sky_ring = skies * term_count * Int128(ring_pixels) * sky_bytes
     active_sky_ring = complete_ring ?
         Int128(0) :
-        skies * term_count * Int128(actives) * complex_bytes
+        skies * term_count * Int128(actives) * sky_bytes
 
+    sky_fft = spin_reduction ?
+        skies * (3Int128(Mmax)+2) * tile * Int128(ring_pixels) * complex_bytes : Int128(0)
+    contraction_workspace = spin_reduction ?
+        skies * beams * Int128(actives) * complex_bytes : Int128(0)
     build_peak = effective_kernel + beam_workspace + effective_beam
-    contract_peak = effective_beam + sky_ring + active_sky_ring
-    tile_peak = max(build_peak, contract_peak)
+    contract_peak = effective_beam + sky_ring + active_sky_ring + contraction_workspace
+    tile_peak = max(build_peak, contract_peak, sky_fft + sky_ring)
 
     return (
         ringd_plan=ringd_plan,
@@ -96,6 +103,8 @@ function ring_memory_bytes(
         effective_beam=effective_beam,
         sky_ring=sky_ring,
         active_sky_ring=active_sky_ring,
+        sky_fft=sky_fft,
+        contraction_workspace=contraction_workspace,
         tile_peak=tile_peak,
         total=persistent + tile_peak,
     )
@@ -149,9 +158,10 @@ batches. Scan moments, ringD, accumulators,
 the uploaded alm/table and cuFFT's plan-dependent workspace are excluded.
 """
 function streamed_tile_bytes(cp, ring_pixels, active_pixels, tile;
-                             precision=Float32, complete_ring=false)
+                             precision=Float32, complete_ring=false,
+                             spin_reduction::Bool=false)
     sizes = ring_memory_bytes(cp, ring_pixels, active_pixels, tile;
-                              precision, complete_ring)
+                              precision, complete_ring, spin_reduction)
     bytes = Int128(sizeof(Complex{precision}))
     modes = Int128(2calc_Mmax(cp, cp.lstop) + 1)
     delta = Int128(2cp.κ + 1)
@@ -160,12 +170,15 @@ function streamed_tile_bytes(cp, ring_pixels, active_pixels, tile;
     matrices = 3 * beams * delta * modes * tile * bytes
     gemm = 3 * beams * Int128(active_pixels) * modes * tile * bytes
     beam_peak = max(packed + matrices, matrices + gemm + sizes.effective_beam)
-    return sizes.effective_kernel + sizes.sky_ring + sizes.active_sky_ring + beam_peak
+    contract_peak = sizes.effective_beam + sizes.contraction_workspace
+    return max(sizes.sky_fft + sizes.sky_ring,
+        sizes.effective_kernel + sizes.sky_ring + sizes.active_sky_ring + max(beam_peak, contract_peak))
 end
 
-function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction)
+function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction;
+                     spin_reduction::Bool=false)
     unit = streamed_tile_bytes(cp_batch, geometry.pixel_count, length(active), 1;
-                               precision=T, complete_ring=active.complete)
+                               precision=T, complete_ring=active.complete, spin_reduction)
     budget = floor(Int128, fraction * Float64(_available_device_bytes()))
     index_limit = max_indexable_l_tile(cp_batch, length(active))
     ceiling = min(cp_batch.lstop - cp_batch.lstart + 1, index_limit)

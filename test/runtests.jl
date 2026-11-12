@@ -4240,3 +4240,5 @@ end
     @test_throws ArgumentError prepare_hwp_blm(cp,raw;lowell_hwp=:invalid)
     @test Scanvolver._hwp_lowell_weights(0,0,2,4)[3] ≈ sqrt(5)/3 atol=1e-15
 end
+
+include("test_spin_reduction.jl")

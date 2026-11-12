@@ -77,6 +77,7 @@ to an HDF5 file ring by ring.
 ## Documentation
 
 - [Rotating HWP convolution](docs/hwp_convolution.md): Mueller mixing, the `2ψ+4η` convention, phase-bearing scans, and V=0 scope.
+- [Real Stokes spin reduction](docs/spin_reduction.md): independent sky modes, real contraction, legacy comparison mode and memory accounting.
 - [Kappa estimation](docs/kappa_estimation.md): choose a candidate Fourier band
   with `estimate_kappa(; nside, lmax, nmax)` on the CPU (default `ε=1e-5`,
   optionally the sole positional argument), including

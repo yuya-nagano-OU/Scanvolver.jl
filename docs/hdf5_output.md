@@ -64,6 +64,7 @@ need to tune the tile width by hand.
 | `max_l_tile` | `32` | Upper limit on the automatically selected tile width. |
 | `memory_fraction` | `0.7` | Fraction of currently available GPU memory that the tile selector may use. Must be in `(0, 1]`. |
 | `moment_method` | `:gemm` | GPU scan-moment implementation. The production default is `:gemm`; `:direct` is also available. |
+| `spin_reduction` | `:auto` | Use independent real Stokes sky modes when the exact reality conditions hold. `:on` requires them; `:off` selects the full-complex path. See [spin reduction](spin_reduction.md). |
 | `map_precision` | input precision | Element type of the output map, either `Float32` or `Float64`. Compute precision comes from the prepared inputs. |
 | `rcond` | `1e-2` | Relative conditioning threshold for the per-pixel `(I,Q,U)` solve. Insufficiently constrained pixels become `unseen`. |
 | `unseen` | `NaN` | Value written for unobserved or insufficiently constrained pixels. It must be finite or `NaN`, not infinity. |

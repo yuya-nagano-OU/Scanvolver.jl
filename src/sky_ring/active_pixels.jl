@@ -125,10 +125,13 @@ tile of different width.
 kernel launch and no allocation. The result then aliases `sky_ring`, so release
 it with `free_active_sky_ring!` rather than `CUDA.unsafe_free!`.
 """
-function select_active_sky_ring_gpu(
-    sky_ring::CuArray{Complex{T},3},
+select_active_sky_ring_gpu(sky_ring::CuArray{Complex{T},3}, active::ActiveRingPixels) where {T<:_HARMONIC_PRECISIONS} =
+    _select_active_sky_ring_values(sky_ring, active)
+
+function _select_active_sky_ring_values(
+    sky_ring::CuArray{T,3},
     active::ActiveRingPixels,
-) where {T<:_HARMONIC_PRECISIONS}
+) where {T}
     CUDA.functional() || throw(ArgumentError(
         "CUDA.jl is loaded but no functional GPU is available",
     ))
@@ -154,7 +157,7 @@ function select_active_sky_ring_gpu(
     ))
 
     gathered = CUDA.zeros(
-        Complex{T},
+        T,
         sky_count,
         term_count,
         active.active_count,

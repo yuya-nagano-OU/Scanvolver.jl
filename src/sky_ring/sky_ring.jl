@@ -169,6 +169,10 @@ The inverse FFT is performed directly in the final GEMM layout
 `U[sky, (spin,M,l), pixel]`. Spin varies fastest in `(0,+2,-2)` order,
 followed by signed `M`, then `l`. Modes that alias on a short polar ring are
 summed into the same FFT bin exactly; no post-FFT transpose is required.
+
+With spin-reduced `GPUAlm`, only independent scalar/polarization modes are
+transformed. The result is an opaque real tile accepted by the active-pixel
+gather and convolution functions, with half the resident sky-tile bytes.
 """
 function build_sky_ring_gpu(
     cp::ConvolutionParams,
@@ -194,6 +198,10 @@ function build_sky_ring_gpu(
     ))
 
     pixel_count = length(phi_pixels)
+    if size(alm.values, 2) == 2
+        return _build_spin_reduced_sky_ring(cp, ringd, alm, phi0, pixel_count,
+            first_l, last_l, plan_cache)
+    end
     Mmax_global = calc_Mmax(cp, cp.lstop)
     M_count = 2 * Mmax_global + 1
     tile_count = last_l - first_l + 1
