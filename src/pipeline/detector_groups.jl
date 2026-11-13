@@ -180,19 +180,20 @@ Convolve every input detector beam, combine consecutive detector groups at the
 sufficient-statistic level, then perform one Scanvolver mapmaking solve per
 group. The ring queue, tiling and HDF5 bookkeeping are those of
 `convolve_to_hdf5`; only the per-batch solve and the file
-metadata differ. The default group order is `Qp,Qm,Up,Um` with offsets
+metadata differ. `group_batch_size=:auto` (the default) and `devices=:auto`
+work as in `convolve_to_hdf5`, in whole detector groups. The default group order is `Qp,Qm,Up,Um` with offsets
 `0, pi/2, pi/4, 3pi/4`.
 """
 function convolve_detector_groups_to_hdf5(
     cp::ConvolutionParams, buffer::RingScanBuffer,
     alm::PreparedAlm{T}, blm::PreparedBlm{T};
-    output_path::AbstractString, group_batch_size::Integer=4,
+    output_path::AbstractString, group_batch_size=:auto,
     detector_labels=DEFAULT_DETECTOR_LABELS,
     detector_offsets=DEFAULT_DETECTOR_OFFSETS,
     detector_weights=ones(length(detector_offsets)),
     devices=[0], rings=buffer.first_ring:buffer.last_ring,
-    beta_order::Integer=8, l_tile=:auto, max_l_tile::Integer=32,
-    memory_fraction::Real=0.7, moment_method::Symbol=:gemm,
+    beta_order::Integer=8, l_tile=:auto, max_l_tile=:auto,
+    memory_fraction=:auto, moment_method::Symbol=:gemm,
     map_precision::Type=T, rcond::Real=1e-2, unseen::Real=NaN,
     reclaim_interval::Integer=16,
     sky_ids=string.(1:cp.numofsky),
@@ -214,7 +215,9 @@ function convolve_detector_groups_to_hdf5(
     ring_list, device_list, path = check_run_inputs(
         cp, buffer, alm, blm; map_precision, rings, devices, output_path, l_tile,
         max_l_tile, memory_fraction, rcond, unseen, reclaim_interval)
-    group_batch_size > 0 || throw(ArgumentError("batch and tile sizes must be positive"))
+    batch_size = resolve_batch_size(group_batch_size, cp, T, device_list;
+                                    multiple=detector_count, beta_order, l_tile,
+                                    max_l_tile, memory_fraction)
     length(sky_ids) == cp.numofsky || throw(ArgumentError("sky ID count does not match cp"))
     length(input_beam_ids) == cp.numofbeam || throw(ArgumentError(
         "input beam ID count does not match cp",
@@ -230,15 +233,16 @@ function convolve_detector_groups_to_hdf5(
             ))
         end
     end
-    layout = DetectorGroupMaps(Int(group_batch_size), detector_labels, detector_offsets,
+    layout = DetectorGroupMaps(batch_size, detector_labels, detector_offsets,
                                detector_weights, input_beam_ids, group_ids,
                                input_beam_metadata, group_metadata)
-    batches = detector_group_batches(blm, detector_count, group_batch_size)
+    batches = detector_group_batches(blm, detector_count, batch_size)
     return run_rings(
         layout, cp, buffer, alm, blm, batches, path, ring_list, device_list;
         beta_order, l_tile, max_l_tile, memory_fraction, moment_method, map_precision,
         rcond, unseen, reclaim_interval, sky_ids, metadata, batch_callback,
-        progress_callback)
+        progress_callback,
+        batch_size_setting=group_batch_size === :auto ? "auto" : "manual")
 end
 
 """Read a completed ring as `(sky, detector_group, I/Q/U, ring_pixel)`."""

@@ -2297,6 +2297,89 @@ end
     @test max_indexable_l_tile(cp, 16) == full_range
     @test_throws ArgumentError max_indexable_l_tile(cp, 0)
 
+    # The automatic beam batch: whatever it picks must fit its own budget and
+    # the Int32 ceiling on the widest ring, in whole detector groups.
+    many = ConvolutionParams(big; numofsky=22, numofbeam=100)
+    device_bytes = Int128(48) * 2^30
+    for multiple in (1, 4)
+        chosen = plan_beam_batches(many, Float32; available_bytes=device_bytes, multiple,
+                                   memory_fraction=0.7, max_l_tile=32)
+        batch = ConvolutionParams(many; numofbeam=chosen.batch_size)
+        @test chosen.batch_size % multiple == 0
+        @test 1 <= chosen.batch_size <= many.numofbeam
+        @test chosen.batch_count == cld(many.numofbeam, chosen.batch_size)
+        @test chosen.tile_count == cld(1201, chosen.l_tile)
+        @test 1 <= chosen.l_tile <= min(32, max_indexable_l_tile(batch, 2048))
+        @test chosen.tile_bytes ==
+            streamed_tile_bytes(batch, 2048, 2048, chosen.l_tile; precision=Float32)
+        @test chosen.tile_bytes <= chosen.tile_budget
+        @test chosen.resident_bytes == resident_ring_bytes(many, Float32)
+        @test chosen.tile_budget ==
+            floor(Int128, 0.7 * Float64(device_bytes - chosen.resident_bytes))
+    end
+    # 100 beams in five batches of 20; detector groups of four stay whole.
+    @test plan_beam_batches(many, Float32; available_bytes=device_bytes).batch_size == 20
+    @test plan_beam_batches(many, Float32; available_bytes=device_bytes, multiple=4).batch_size == 20
+    odd = ConvolutionParams(many; numofbeam=288)
+    @test plan_beam_batches(odd, Float32; available_bytes=device_bytes).batch_size == 20
+    @test plan_beam_batches(odd, Float32; available_bytes=device_bytes, multiple=8).batch_size == 24
+    # A device too small for 20 beams gets the largest batch that does fit.
+    tight = plan_beam_batches(many, Float32; available_bytes=Int128(99) * 2^30 ÷ 10)
+    @test 1 <= tight.batch_size < 20
+    @test tight.tile_bytes <= tight.tile_budget
+    wider = ConvolutionParams(many; numofbeam=tight.batch_size + 1)
+    @test streamed_tile_bytes(wider, 2048, 2048, 1; precision=Float32) +
+        ring_memory_bytes(wider, 2048, 2048, 1; precision=Float32).sky_ring > tight.tile_budget
+    # A fixed l tile is kept; a small problem takes every beam in one batch.
+    fixed = plan_beam_batches(many, Float32; available_bytes=device_bytes, l_tile=2)
+    @test fixed.l_tile == 2
+    small = plan_beam_batches(cp, Float64; available_bytes=device_bytes)
+    @test small.batch_size == cp.numofbeam
+    @test small.l_tile == min(full_range, 8)
+
+    # Automatic memory fraction and tile cap: the cuFFT workspace is charged as
+    # one more sky tile per multipole, and only the index limit caps the width.
+    automatic = plan_beam_batches(many, Float32; available_bytes=device_bytes)
+    automatic_cp = ConvolutionParams(many; numofbeam=automatic.batch_size)
+    charged = streamed_tile_bytes(automatic_cp, 2048, 2048, 1; precision=Float32) +
+        ring_memory_bytes(automatic_cp, 2048, 2048, 1; precision=Float32).sky_ring
+    @test automatic.tile_bytes == charged * automatic.l_tile
+    @test automatic.tile_budget == floor(Int128,
+        0.95 * Float64(device_bytes - automatic.resident_bytes)) - 16 * 2^20
+    @test automatic.tile_bytes <= automatic.tile_budget
+    @test automatic.l_tile <= max_indexable_l_tile(automatic_cp, 2048)
+    @test Scanvolver.resolve_memory_fraction(:auto) == (0.95, true)
+    @test Scanvolver.resolve_memory_fraction(0.5) == (0.5, false)
+    @test Scanvolver.resolve_max_l_tile(:auto, 1201) == 8
+    @test Scanvolver.resolve_max_l_tile(:auto, 3) == 3
+    @test automatic.l_tile == 8
+    @test Scanvolver.resolve_max_l_tile(8, 1201) == 8
+    @test_throws ArgumentError Scanvolver.resolve_memory_fraction(:half)
+    @test_throws ArgumentError Scanvolver.resolve_max_l_tile(0, 1201)
+
+    # Out-of-memory backoff: halve until it fits, never below one multipole,
+    # and only for an automatic tile and a device out-of-memory error.
+    attempts = Int[]
+    resets = Ref(0)
+    outcome = Scanvolver.with_tile_backoff(() -> resets[] += 1, 9; adaptive=true) do width
+        push!(attempts, width)
+        width > 3 && throw(CUDA.OutOfGPUMemoryError(1))
+        :done
+    end
+    @test outcome == (:done, 3, 2)
+    @test attempts == [9, 5, 3]
+    @test resets[] == 2
+    always = width -> throw(CUDA.OutOfGPUMemoryError(1))
+    @test_throws CUDA.OutOfGPUMemoryError Scanvolver.with_tile_backoff(always, () -> nothing, 4; adaptive=true)
+    @test_throws CUDA.OutOfGPUMemoryError Scanvolver.with_tile_backoff(always, () -> nothing, 4; adaptive=false)
+    @test_throws ErrorException Scanvolver.with_tile_backoff(
+        width -> error("other"), () -> nothing, 4; adaptive=true)
+    @test_throws ArgumentError plan_beam_batches(many, Float32; available_bytes=2^30)
+    @test_throws ArgumentError plan_beam_batches(many, Float32;
+        available_bytes=device_bytes, multiple=3)
+    @test_throws ArgumentError plan_beam_batches(many, Float32;
+        available_bytes=device_bytes, memory_fraction=0)
+
     if CUDA.functional()
         # The estimate must be the actual allocation, byte for byte.
         ring = 7

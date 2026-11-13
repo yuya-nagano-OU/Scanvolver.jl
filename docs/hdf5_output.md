@@ -56,13 +56,13 @@ need to tune the tile width by hand.
 | Keyword | Default | Meaning |
 |---|---:|---|
 | `output_path` | required | New HDF5 file to create. Its parent directory must exist, and an existing path is never overwritten. |
-| `beam_batch_size` | `9` | Number of beams applied together. Larger batches can improve throughput but require more temporary GPU memory. |
-| `devices` | `[0]` | Zero-based CUDA device IDs. Each device needs one Julia thread. |
+| `beam_batch_size` | `:auto` | Number of beams applied together. `:auto` uses batches of about 20 beams, fewer if the GPU memory requires it (see below); a positive integer fixes it. `convolve_detector_groups_to_hdf5` has `group_batch_size`, counted in detector groups, with the same default. |
+| `devices` | `[0]` | Zero-based CUDA device IDs, or `:auto` for every CUDA device that has a Julia thread. Each device needs one Julia thread. |
 | `rings` | every buffered ring | Unique ring numbers to process, all inside the `RingScanBuffer`. |
 | `beta_order` | `8` | Chebyshev order used for the automatic small-angle Wigner representation. |
 | `l_tile` | `:auto` | Multipole tile width. `:auto` chooses the widest tile allowed by the memory budget. |
-| `max_l_tile` | `32` | Upper limit on the automatically selected tile width. |
-| `memory_fraction` | `0.7` | Fraction of currently available GPU memory that the tile selector may use. Must be in `(0, 1]`. |
+| `max_l_tile` | `:auto` | Upper limit on the automatically selected tile width. `:auto` is 8: wider tiles measured no faster (see below). |
+| `memory_fraction` | `:auto` | `:auto` counts the cuFFT workspace of each ring in the tile size and uses 95% of the available GPU memory. A number in `(0, 1]` is the fraction the explicit tile buffers may take, with the cuFFT workspace left to the remainder. |
 | `moment_method` | `:gemm` | GPU scan-moment implementation. The production default is `:gemm`; `:direct` is also available. |
 | `map_precision` | input precision | Element type of the output map, either `Float32` or `Float64`. Compute precision comes from the prepared inputs. |
 | `rcond` | `1e-2` | Relative conditioning threshold for the per-pixel `(I,Q,U)` solve. Insufficiently constrained pixels become `unseen`. |
@@ -123,10 +123,55 @@ intermediates are bounded by the batch size. The host holds the inputs, the
 scan buffer, the beam batches and the current ring's batch maps. Skies are not
 split.
 
-`l_tile=:auto` picks the widest tile whose K, full U and gathered U fit together
-in `memory_fraction` (default 0.7) of the GPU memory still available once the
-moments, ringD and accumulators are allocated. The cuFFT workspace depends on
-the plan and is left as headroom. If not even one multipole fits, the run fails.
+`l_tile=:auto` picks the widest tile that fits the GPU memory still available
+once the moments, ringD and accumulators are allocated. The explicit buffers
+(K, full U, gathered U and the beam workspace) come from the closed-form model
+`streamed_tile_bytes`. With `memory_fraction=:auto` the cuFFT workspace is added
+to them: `sky_ring_fft_workspace_bytes` asks cuFFT (`cufftEstimateMany`) what
+the ring's transform needs, which is either nothing or one more copy of U
+depending on the ring length, and the tile may then use 95% of the available
+memory. A numeric `memory_fraction` keeps the earlier rule, in which the cuFFT
+workspace is not counted and has to fit in the unused fraction. If not even one
+multipole fits, the run fails.
+
+Should the device still run out of memory inside an automatic tile, the ring's
+accumulators are cleared and its tiles restart at half the width, down to one
+multipole. `rings/tile_retries` counts these restarts; a nonzero value means the
+model missed something on that ring. A fixed `l_tile` is never changed.
+
+`beam_batch_size=:auto` calls `plan_beam_batches` once, before anything is
+uploaded. The beams are split into the fewest batches of about 20 each (whole
+detector groups in `convolve_detector_groups_to_hdf5`). The plan is checked on
+the widest ring (`4 * nside` pixels, all hit) of the device with the least free
+memory: `resident_ring_bytes` (skies, table, ringD, moments, all-beam
+accumulators) is taken off the free memory, and if a batch of that size does not
+fit with at least one multipole, the largest batch that does is used.
+
+Both automatic sizes come from a timing sweep rather than from the memory
+limit, because filling the GPU buys no speed. One RTX A6000, Float32, nside 512,
+lmax 1200, bnmax 120, kappa 10, two full rings with 64 hits per pixel, seconds
+per ring (equatorial ring 1024 / ring 511):
+
+| 10 skies, 40 beams | `l_tile` 1 | 2 | 4 | 8 |
+|---|---:|---:|---:|---:|
+| batch 5 | 36.2 / 39.7 | 35.6 / 39.1 | 35.6 / 39.3 | 35.3 / 39.3 |
+| batch 10 | 28.0 / 31.5 | 27.5 / 31.4 | 27.6 / 31.2 | 27.7 / 31.7 |
+| batch 20 | 26.7 / 30.3 | 26.8 / 30.4 | 26.7 / 30.4 | 26.7 / 31.5 |
+| batch 40 | 26.8 / 30.3 | 26.9 / 30.6 | 27.8 / 31.0 | 27.4 / 33.7 |
+
+With 5 skies and 5 beams in one batch, `l_tile` 4, 8, 16, 32 and 64 took
+8.1, 8.1, 8.4, 8.4 and 8.5 s on ring 1024 and 9.9, 9.8, 10.4, 11.0 and 11.3 s on
+ring 511. The sweep is one configuration on one GPU model; other shapes may
+have a different optimum, and explicit values override the automatic ones.
+The value used is stored in the
+`beam_batch_size` attribute and `batch_size_setting` says whether it was
+`auto` or `manual`; `memory_fraction_setting` and `max_l_tile_setting` do the
+same for the resolved numbers in `memory_fraction` and `max_l_tile`. The same function can be called beforehand to see the plan:
+
+```julia
+plan = plan_beam_batches(cp, Float32; available_bytes=CUDA.free_memory())
+plan.batch_size, plan.l_tile, plan.tile_bytes, plan.resident_bytes
+```
 
 Changing `beam_batch_size` changes the output width of the contraction GEMM and
 with it cuBLAS's summation order, so runs with different batch sizes agree to

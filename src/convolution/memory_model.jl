@@ -163,10 +163,72 @@ function streamed_tile_bytes(cp, ring_pixels, active_pixels, tile;
     return sizes.effective_kernel + sizes.sky_ring + sizes.active_sky_ring + beam_peak
 end
 
-function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction)
+# What `memory_fraction=:auto` leaves unused: the explicit buffers and the cuFFT
+# workspace are both counted then, so this only covers allocator granularity.
+const _AUTO_MEMORY_FRACTION = 0.95
+# A cuFFT plan measures about 10 MiB above cufftEstimateMany, whatever its size.
+const _CUFFT_PLAN_OVERHEAD_BYTES = Int128(16) * 2^20
+
+"""
+`(fraction, count_fft)` of a `memory_fraction` setting. A number is the share of
+the available device memory the explicit tile buffers may take, with the cuFFT
+workspace left to the remainder. `:auto` counts the cuFFT workspace as well and
+uses all but a small reserve.
+"""
+function resolve_memory_fraction(setting)
+    setting === :auto && return _AUTO_MEMORY_FRACTION, true
+    setting isa Real && isfinite(setting) && 0 < setting <= 1 ||
+        throw(ArgumentError("memory_fraction must be :auto or in (0, 1], got $setting"))
+    return Float64(setting), false
+end
+
+# Measured on an RTX A6000 (see plan_beam_batches): batches of about 20 beams are
+# as fast as larger ones, and tiles wider than 8 multipoles are no faster.
+const _AUTO_BEAM_BATCH = 20
+const _AUTO_MAX_L_TILE = 8
+
+"""Upper limit of an automatic `l` tile: `_AUTO_MAX_L_TILE` for `:auto`."""
+function resolve_max_l_tile(setting, l_count::Integer)
+    setting === :auto && return min(Int(l_count), _AUTO_MAX_L_TILE)
+    setting isa Integer && setting > 0 ||
+        throw(ArgumentError("max_l_tile must be :auto or a positive integer, got $setting"))
+    return Int(setting)
+end
+
+"""
+    sky_ring_fft_workspace_bytes(precision, sky_count, term_count, pixel_count) -> Int128
+
+Device bytes cuFFT allocates for the in-place inverse transform along the pixel
+axis of `U[sky, term, pixel]`, asked of cuFFT itself (`cufftEstimateMany`, the
+strided batched layout `build_sky_ring_gpu` plans). It is either nothing, on
+ring lengths cuFFT handles directly, or one more copy of `U`; on an RTX A6000
+the measured plan allocation is this value plus about 10 MiB, which
+`_CUFFT_PLAN_OVERHEAD_BYTES` covers. Needs a functional CUDA device.
+"""
+function sky_ring_fft_workspace_bytes(precision::Type, sky_count::Integer,
+                                      term_count::Integer, pixel_count::Integer)
+    batch = Int128(sky_count) * Int128(term_count)
+    array_bytes = batch * pixel_count * 2 * sizeof(precision)
+    # Beyond the 32-bit estimate interface, assume the larger of the two cases.
+    max(batch, pixel_count) <= typemax(Cint) || return array_bytes
+    workspace = Ref{Csize_t}(0)
+    lengths = Cint[pixel_count]
+    kind = precision === Float32 ? CUDA.CUFFT.CUFFT_C2C : CUDA.CUFFT.CUFFT_Z2Z
+    CUDA.CUFFT.cufftEstimateMany(1, lengths, lengths, Cint(batch), Cint(1), lengths,
+                                 Cint(batch), Cint(1), kind, Cint(batch), workspace)
+    return Int128(workspace[])
+end
+
+function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction;
+                     count_fft::Bool=false)
     unit = streamed_tile_bytes(cp_batch, geometry.pixel_count, length(active), 1;
                                precision=T, complete_ring=active.complete)
     budget = floor(Int128, fraction * Float64(_available_device_bytes()))
+    if count_fft
+        terms = 3 * (2 * calc_Mmax(cp_batch, cp_batch.lstop) + 1)
+        unit += sky_ring_fft_workspace_bytes(T, cp_batch.numofsky, terms, geometry.pixel_count)
+        budget -= _CUFFT_PLAN_OVERHEAD_BYTES
+    end
     index_limit = max_indexable_l_tile(cp_batch, length(active))
     ceiling = min(cp_batch.lstop - cp_batch.lstart + 1, index_limit)
     width = l_tile === :auto ?
@@ -176,4 +238,101 @@ function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction
         throw(ArgumentError("ring $(geometry.ring): l tile does not fit the device/index budget " *
                             "(one-l bytes=$unit, budget=$budget, index_limit=$index_limit)"))
     return width, unit * width
+end
+
+"""
+    resident_ring_bytes(cp, precision; beta_order=8) -> Int128
+
+Device bytes that stay allocated while the `l` tiles of the widest ring
+(`4 * nside_output` pixels, all hit) are processed: the uploaded skies and
+Wigner-Chebyshev table, the ringD plan and stack, the scan moments and the
+accumulators of every beam. The table term is an upper bound, since it counts
+every `(M, n)` pair of the `kappa` band at every `l`.
+"""
+function resident_ring_bytes(cp::ConvolutionParams, precision::Type; beta_order::Integer=8)
+    pixels = 4 * cp.nside_output
+    complex_bytes = Int128(2 * sizeof(precision))
+    l_count = Int128(cp.lstop - cp.lstart + 1)
+    n_count = Int128(2 * calc_nmax(cp, cp.lstop) + 1)
+    M_count = Int128(2 * calc_Mmax(cp, cp.lstop) + 1)
+    delta_count = Int128(2 * cp.κ + 1)
+    ring = ring_memory_bytes(cp, pixels, pixels, 1; precision)
+    moments = Int128(2) * beta_order * delta_count * n_count * pixels * complex_bytes
+    alm = Int128(2 * cp.lstop + 1) * 3 * cp.numofsky * l_count * complex_bytes
+    table = Int128(beta_order) * delta_count * n_count * l_count * sizeof(precision) +
+            M_count * n_count * sizeof(Int32)
+    return ring.persistent + moments + alm + table
+end
+
+"""
+    plan_beam_batches(cp, precision; available_bytes, memory_fraction=:auto,
+                      l_tile=:auto, max_l_tile=:auto, beta_order=8, multiple=1)
+
+Choose how many beams to apply together, from the memory model alone.
+
+The plan is made for the widest ring (`4 * nside_output` pixels, all hit, with
+the gathered sky copy of an incomplete ring), so it holds for every other ring.
+`available_bytes` is the device memory free before anything is uploaded;
+`resident_ring_bytes` is taken off it and `memory_fraction` of the rest is the
+tile budget, the same rule `l_tile=:auto` applies ring by ring. With
+`memory_fraction=:auto` each multipole of a tile is charged one extra copy of
+the sky tile for the cuFFT workspace, the larger of the two cases
+`sky_ring_fft_workspace_bytes` can return, so the plan needs no device.
+
+The rule follows a timing sweep, not the memory limit (RTX A6000, Float32,
+nside 512, lmax 1200, bnmax 120, kappa 10, 10 skies, 40 beams, two full rings):
+going from 5 to 10 beams per batch made a ring about 22% faster and 10 to 20
+another 3 to 4%, with nothing more at 40; the `l` tile width changed the time
+by 1 to 2% between 1 and 8, and wider tiles were up to 15% slower with 5 skies
+and 5 beams. So the beams are split into the fewest batches of about
+`_AUTO_BEAM_BATCH` each, in whole multiples of `multiple` (the detectors of one
+group, or 1), the batch is reduced only if it does not fit, and the tile is the
+widest that fits the budget, the `Int32` index limit and `max_l_tile`, whose
+`:auto` value is `_AUTO_MAX_L_TILE`. Memory beyond that is left unused because
+it buys no speed.
+
+Returns `(batch_size, l_tile, batch_count, tile_count, tile_bytes,
+resident_bytes, tile_budget)`. Throws `ArgumentError` when not even one group
+of beams and one multipole fit.
+"""
+function plan_beam_batches(cp::ConvolutionParams, precision::Type;
+                           available_bytes::Integer, memory_fraction=:auto,
+                           l_tile=:auto, max_l_tile=:auto,
+                           beta_order::Integer=8, multiple::Integer=1)
+    precision in (Float32, Float64) || throw(ArgumentError(
+        "precision must be Float32 or Float64, got $precision"))
+    fraction, count_fft = resolve_memory_fraction(memory_fraction)
+    l_tile === :auto || (l_tile isa Integer && l_tile > 0) || throw(ArgumentError("invalid l_tile"))
+    tile_cap = resolve_max_l_tile(max_l_tile, cp.lstop - cp.lstart + 1)
+    multiple > 0 && cp.numofbeam % multiple == 0 || throw(ArgumentError(
+        "$(cp.numofbeam) beams cannot be divided into groups of $multiple"))
+
+    pixels = 4 * cp.nside_output
+    l_count = cp.lstop - cp.lstart + 1
+    resident = resident_ring_bytes(cp, precision; beta_order)
+    budget = floor(Int128, fraction * Float64(max(Int128(available_bytes) - resident, 0)))
+    count_fft && (budget -= _CUFFT_PLAN_OVERHEAD_BYTES)
+
+    target = cld(cp.numofbeam, cld(cp.numofbeam, _AUTO_BEAM_BATCH))
+    preferred = min(cp.numofbeam, cld(target, multiple) * multiple)
+    best = nothing
+    for batch_size in preferred:-multiple:multiple
+        cp_batch = ConvolutionParams(cp; numofbeam=batch_size)
+        unit = streamed_tile_bytes(cp_batch, pixels, pixels, 1; precision)
+        count_fft && (unit += ring_memory_bytes(cp_batch, pixels, pixels, 1; precision).sky_ring)
+        ceiling = min(l_count, max_indexable_l_tile(cp_batch, pixels))
+        width = l_tile === :auto ?
+            Int(min(Int128(min(ceiling, tile_cap)), max(budget, 0) ÷ unit)) :
+            min(Int(l_tile), l_count)
+        1 <= width <= ceiling && unit * width <= budget || continue
+        best = (; batch_size, l_tile=width, batch_count=cld(cp.numofbeam, batch_size),
+                tile_count=cld(l_count, width), tile_bytes=unit * width,
+                resident_bytes=resident, tile_budget=budget)
+        break
+    end
+    best === nothing && throw(ArgumentError(
+        "no beam batch fits the device: available=$(available_bytes) bytes, " *
+        "resident=$resident, tile budget=$budget; reduce the sky or beam count, " *
+        "kappa or l_tile, or use a larger GPU"))
+    return best
 end

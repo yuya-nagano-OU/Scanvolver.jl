@@ -62,6 +62,7 @@ export RingScanBuffer, build_ring_scan_buffer
 export ring_scan_buffer_bytes, ring_hit_count
 export accumulate_convolution_tile_gemm_gpu!
 export ring_memory_bytes, max_indexable_l_tile, streamed_tile_bytes
+export resident_ring_bytes, plan_beam_batches, sky_ring_fft_workspace_bytes
 export RingConvolution, ring_stokes
 export convolve_to_hdf5, read_ring_hdf5
 export convolve_detector_groups_to_hdf5, detector_group_batches

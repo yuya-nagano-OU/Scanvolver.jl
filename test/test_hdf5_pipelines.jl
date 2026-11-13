@@ -199,6 +199,65 @@ end
             end
         end
 
+        @testset "automatic batch size and devices" begin
+            T = Float32
+            alm = prepare_alm(cp,raw_alm;precision=T)
+            blm = prepare_blm(cp,raw_blm;precision=T)
+            reference = _pipeline_reference(cp, buffer, alm, blm, T)
+            path = joinpath(output,"automatic.h5")
+            convolve_to_hdf5(cp,buffer,alm,blm;output_path=path,devices=:auto)
+            actual = h5open(path,"r") do file
+                @test read(attributes(file)["batch_size_setting"]) == "auto"
+                @test read(attributes(file)["memory_fraction_setting"]) == "auto"
+                @test read(attributes(file)["max_l_tile_setting"]) == "auto"
+                @test read(attributes(file)["max_l_tile"]) == min(cp.lstop - cp.lstart + 1, 8)
+                @test all(==(0), read(file["rings/tile_retries"]))
+                @test all(read(file["rings/tile_count"])[read(file["rings/active_pixels"]) .> 0] .==
+                          cld(cp.lstop - cp.lstart + 1, 8))
+                # The fixture is tiny, so every beam fits one batch.
+                @test read(attributes(file)["beam_batch_size"]) == cp.numofbeam
+                @test read(file["devices"]) ==
+                    collect(0:min(length(CUDA.devices()),Threads.nthreads())-1)
+                permutedims(read(file["map"]), (4,3,2,1))
+            end
+            _compare_pipeline_maps(reference, actual, T)
+            manual = joinpath(output,"manual.h5")
+            convolve_to_hdf5(cp,buffer,alm,blm;output_path=manual,beam_batch_size=2,
+                             memory_fraction=0.7,max_l_tile=4)
+            h5open(manual,"r") do file
+                @test read(attributes(file)["memory_fraction_setting"]) == "manual"
+                @test read(attributes(file)["memory_fraction"]) == 0.7
+                @test read(attributes(file)["max_l_tile"]) == 4
+                @test read(attributes(file)["batch_size_setting"]) == "manual"
+                @test read(attributes(file)["beam_batch_size"]) == 2
+            end
+            for bad in (0, :widest)
+                @test_throws ArgumentError convolve_to_hdf5(cp,buffer,alm,blm;
+                    output_path=joinpath(output,"bad.h5"),beam_batch_size=bad)
+            end
+        end
+
+        @testset "cuFFT workspace estimate" begin
+            # The estimate plus the fixed overhead must cover what a plan really
+            # takes, on a direct length and on one that needs a second buffer.
+            for T in (Float32, Float64), pixel_count in (2048, 2044)
+                values = CUDA.zeros(Complex{T}, 4, 300, pixel_count)
+                CUDA.synchronize()
+                before = CUDA.free_memory()
+                fft_plan = CUDA.CUFFT.plan_ifft!(values, (3,))
+                fft_plan * values
+                CUDA.synchronize()
+                taken = Int128(before) - Int128(CUDA.free_memory())
+                estimate = sky_ring_fft_workspace_bytes(T, 4, 300, pixel_count)
+                @test estimate in (0, sizeof(values))
+                @test taken <= estimate + Scanvolver._CUFFT_PLAN_OVERHEAD_BYTES
+                finalize(fft_plan.p)
+                empty!(CUDA.CUFFT.idle_handles)
+                CUDA.unsafe_free!(values)
+            end
+            @test sky_ring_fft_workspace_bytes(Float32, 4, 300, 2044) == 4 * 300 * 2044 * 8
+        end
+
         @testset "partial rings, writer errors and beta errors" begin
             T = Float64
             alm = prepare_alm(cp,raw_alm;precision=T)
