@@ -2298,6 +2298,100 @@ end
     @test max_indexable_l_tile(cp, 16) == full_range
     @test_throws ArgumentError max_indexable_l_tile(cp, 0)
 
+    # The automatic beam batch: whatever it picks must fit its own budget and
+    # the Int32 ceiling on the widest ring, in whole detector groups.
+    many = ConvolutionParams(big; numofsky=22, numofbeam=100)
+    device_bytes = Int128(48) * 2^30
+    for multiple in (1, 4)
+        chosen = plan_beam_batches(many, Float32; available_bytes=device_bytes, multiple,
+                                   memory_fraction=0.7, max_l_tile=32)
+        batch = ConvolutionParams(many; numofbeam=chosen.batch_size)
+        @test chosen.batch_size % multiple == 0
+        @test 1 <= chosen.batch_size <= many.numofbeam
+        @test chosen.batch_count == cld(many.numofbeam, chosen.batch_size)
+        @test chosen.tile_count == cld(1201, chosen.l_tile)
+        @test 1 <= chosen.l_tile <= min(32, max_indexable_l_tile(batch, 2048))
+        @test chosen.tile_bytes ==
+            streamed_tile_bytes(batch, 2048, 2048, chosen.l_tile; precision=Float32)
+        @test chosen.tile_bytes <= chosen.tile_budget
+        @test chosen.resident_bytes == resident_ring_bytes(many, Float32)
+        @test chosen.tile_budget ==
+            floor(Int128, 0.7 * Float64(device_bytes - chosen.resident_bytes))
+    end
+    # Several HWP moment sets can exhaust a budget that fits a single set.
+    single_beam = ConvolutionParams(cp; numofbeam=1)
+    one_moment = plan_beam_batches(single_beam, Float64; available_bytes=device_bytes,
+                                   memory_fraction=1, l_tile=1)
+    limited_bytes = one_moment.resident_bytes + one_moment.tile_bytes
+    @test plan_beam_batches(single_beam, Float64; available_bytes=limited_bytes,
+                           memory_fraction=1, l_tile=1).batch_size == 1
+    @test_throws ArgumentError plan_beam_batches(single_beam, Float64;
+        available_bytes=limited_bytes, memory_fraction=1, l_tile=1, moment_count=5)
+    @test_throws ArgumentError resident_ring_bytes(cp, Float64; moment_count=0)
+
+    # 100 beams in five batches of 20; detector groups of four stay whole.
+    @test plan_beam_batches(many, Float32; available_bytes=device_bytes).batch_size == 20
+    @test plan_beam_batches(many, Float32; available_bytes=device_bytes, multiple=4).batch_size == 20
+    odd = ConvolutionParams(many; numofbeam=288)
+    @test plan_beam_batches(odd, Float32; available_bytes=device_bytes).batch_size == 20
+    @test plan_beam_batches(odd, Float32; available_bytes=device_bytes, multiple=8).batch_size == 24
+    # A device too small for 20 beams gets the largest batch that does fit.
+    tight = plan_beam_batches(many, Float32; available_bytes=Int128(99) * 2^30 ÷ 10)
+    @test 1 <= tight.batch_size < 20
+    @test tight.tile_bytes <= tight.tile_budget
+    wider = ConvolutionParams(many; numofbeam=tight.batch_size + 1)
+    @test streamed_tile_bytes(wider, 2048, 2048, 1; precision=Float32) +
+        ring_memory_bytes(wider, 2048, 2048, 1; precision=Float32).sky_ring > tight.tile_budget
+    # A fixed l tile is kept; a small problem takes every beam in one batch.
+    fixed = plan_beam_batches(many, Float32; available_bytes=device_bytes, l_tile=2)
+    @test fixed.l_tile == 2
+    small = plan_beam_batches(cp, Float64; available_bytes=device_bytes)
+    @test small.batch_size == cp.numofbeam
+    @test small.l_tile == min(full_range, 8)
+
+    # Automatic memory fraction and tile cap: the cuFFT workspace is charged as
+    # one more sky tile per multipole, and only the index limit caps the width.
+    automatic = plan_beam_batches(many, Float32; available_bytes=device_bytes)
+    automatic_cp = ConvolutionParams(many; numofbeam=automatic.batch_size)
+    charged = streamed_tile_bytes(automatic_cp, 2048, 2048, 1; precision=Float32) +
+        ring_memory_bytes(automatic_cp, 2048, 2048, 1; precision=Float32).sky_ring
+    @test automatic.tile_bytes == charged * automatic.l_tile
+    @test automatic.tile_budget == floor(Int128,
+        0.95 * Float64(device_bytes - automatic.resident_bytes)) - 16 * 2^20
+    @test automatic.tile_bytes <= automatic.tile_budget
+    @test automatic.l_tile <= max_indexable_l_tile(automatic_cp, 2048)
+    @test Scanvolver.resolve_memory_fraction(:auto) == (0.95, true)
+    @test Scanvolver.resolve_memory_fraction(0.5) == (0.5, false)
+    @test Scanvolver.resolve_max_l_tile(:auto, 1201) == 8
+    @test Scanvolver.resolve_max_l_tile(:auto, 3) == 3
+    @test automatic.l_tile == 8
+    @test Scanvolver.resolve_max_l_tile(8, 1201) == 8
+    @test_throws ArgumentError Scanvolver.resolve_memory_fraction(:half)
+    @test_throws ArgumentError Scanvolver.resolve_max_l_tile(0, 1201)
+
+    # Out-of-memory backoff: halve until it fits, never below one multipole,
+    # and only for an automatic tile and a device out-of-memory error.
+    attempts = Int[]
+    resets = Ref(0)
+    outcome = Scanvolver.with_tile_backoff(() -> resets[] += 1, 9; adaptive=true) do width
+        push!(attempts, width)
+        width > 3 && throw(CUDA.OutOfGPUMemoryError(1))
+        :done
+    end
+    @test outcome == (:done, 3, 2)
+    @test attempts == [9, 5, 3]
+    @test resets[] == 2
+    always = width -> throw(CUDA.OutOfGPUMemoryError(1))
+    @test_throws CUDA.OutOfGPUMemoryError Scanvolver.with_tile_backoff(always, () -> nothing, 4; adaptive=true)
+    @test_throws CUDA.OutOfGPUMemoryError Scanvolver.with_tile_backoff(always, () -> nothing, 4; adaptive=false)
+    @test_throws ErrorException Scanvolver.with_tile_backoff(
+        width -> error("other"), () -> nothing, 4; adaptive=true)
+    @test_throws ArgumentError plan_beam_batches(many, Float32; available_bytes=2^30)
+    @test_throws ArgumentError plan_beam_batches(many, Float32;
+        available_bytes=device_bytes, multiple=3)
+    @test_throws ArgumentError plan_beam_batches(many, Float32;
+        available_bytes=device_bytes, memory_fraction=0)
+
     if CUDA.functional()
         # The estimate must be the actual allocation, byte for byte.
         ring = 7
@@ -4043,6 +4137,23 @@ end
                     @test read(attributes(f)["hwp_demodulation"]) == "2psi+4eta"
                     @test read(f["hwp_mueller_iquv"]) == M
                 end
+                # Automatic batching, memory and tiles must preserve all HWP
+                # modes, including their expanded Wigner order, on both GPUs.
+                automatic_target=joinpath(dir,label*"_automatic.h5")
+                convolve_to_hdf5(cp,buffer,sky,beams;output_path=automatic_target,
+                    rings=scan.rings,devices=:auto,beta_order=12,max_l_tile=2,rcond=1e-10)
+                h5open(automatic_target,"r") do f
+                    @test read(f["map"])[unique(scan.pixels),:,:,:] ≈ expected[unique(scan.pixels),:,:,:] atol=3e-11 rtol=3e-10
+                    @test read(attributes(f)["batch_size_setting"]) == "auto"
+                    @test read(attributes(f)["memory_fraction_setting"]) == "auto"
+                    @test read(attributes(f)["hwp_effective_bnmax"]) == beams.effective_bnmax
+                    @test read(f["hwp_fourier_modes"]) == string.(beams.modes)
+                    @test read(f["rings/scan_moment_builds"])[scan.rings] == fill(length(beams.modes),length(scan.rings))
+                    @test read(f["rings/kernel_builds"]) == read(f["rings/tile_count"]) .* length(beams.modes)
+                    @test read(f["rings/beam_applications"]) == read(f["rings/kernel_builds"])
+                    @test all(==(0),read(f["rings/tile_retries"]))
+                    @test all(==(4),read(f["rings/tile_count"])[scan.rings])
+                end
                 if label == "random"
                     offsets=[0.23,0.8]; weights=[1.0,2.0]
                     group_target=joinpath(dir,"grouped.h5")
@@ -4061,6 +4172,17 @@ end
                             rhs .+= weights[beam] .* (A' * real.(tod[ids,beam]))
                         end
                         @test grouped[pixel,:,1,1] ≈ normal\rhs atol=3e-11 rtol=3e-10
+                    end
+                    automatic_group_target=joinpath(dir,"grouped_automatic.h5")
+                    convolve_detector_groups_to_hdf5(cp,buffer,sky,beams;
+                        output_path=automatic_group_target,rings=scan.rings,devices=:auto,
+                        beta_order=12,max_l_tile=2,detector_labels=["a","b"],
+                        detector_offsets=offsets,detector_weights=weights,rcond=1e-10)
+                    h5open(automatic_group_target,"r") do f
+                        @test read(f["map"])[unique(scan.pixels),:,:,:] ≈ grouped[unique(scan.pixels),:,:,:] atol=3e-11 rtol=3e-10
+                        @test read(attributes(f)["batch_size_setting"]) == "auto"
+                        @test read(attributes(f)["group_batch_size"]) == 1
+                        @test read(f["rings/beam_applications"]) == read(f["rings/tile_count"]) .* length(beams.modes)
                     end
                     single_target=joinpath(dir,"float32_direct.h5")
                     devices=length(CUDA.devices())>=2 && Threads.nthreads()>=2 ? [0,1] : [0]

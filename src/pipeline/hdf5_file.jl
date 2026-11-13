@@ -39,7 +39,8 @@ end
 # Per-ring records every layout keeps, besides completed/device/beta/elapsed.
 const RING_RECORDS = ("hit_count", "active_pixels", "l_tile", "tile_count",
                       "scan_moment_builds", "ringd_builds", "sky_fft_builds",
-                      "kernel_builds", "beam_applications", "estimated_tile_bytes")
+                      "kernel_builds", "beam_applications", "estimated_tile_bytes",
+                      "tile_retries")
 
 function make_writer(file, layout, cp, plan, rings, T, map_precision, devices,
                      sky_ids, metadata, settings)
@@ -63,7 +64,10 @@ function make_writer(file, layout, cp, plan, rings, T, map_precision, devices,
                          "memory_fraction" => settings.memory_fraction,
                          "l_tile" => string(settings.l_tile),
                          "max_l_tile" => settings.max_l_tile,
-                         "moment_method" => string(settings.moment_method))
+                         "moment_method" => string(settings.moment_method),
+                         "batch_size_setting" => settings.batch_size_setting,
+                         "max_l_tile_setting" => settings.max_l_tile_setting,
+                         "memory_fraction_setting" => settings.memory_fraction_setting)
         attrs[key] = value
     end
     file["sky_ids"] = string.(sky_ids)

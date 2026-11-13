@@ -8,9 +8,19 @@ _SkyRingFFTPlanCache() = _SkyRingFFTPlanCache(
     Dict{Tuple{Vararg{Int}},Any}(),
 )
 
+# cuFFT allocates its workspace from the driver, not from CUDA.jl's pool, so
+# memory the pool has cached counts as available to every array but not to a
+# plan. Hand the cache back when the plan would not fit in what is really free.
+function _free_for_fft_plan!(sky_ring::CuArray{Complex{T},3}) where {T}
+    needed = sky_ring_fft_workspace_bytes(T, size(sky_ring)...) + _CUFFT_PLAN_OVERHEAD_BYTES
+    Int128(CUDA.free_memory()) < needed && CUDA.reclaim()
+    return nothing
+end
+
 function _sky_ring_ifft!(sky_ring, cache::_SkyRingFFTPlanCache)
     key = Tuple(size(sky_ring))
     fft_plan = get!(cache.plans, key) do
+        _free_for_fft_plan!(sky_ring)
         CUDA.CUFFT.plan_ifft!(sky_ring, (3,))
     end
     fft_plan * sky_ring
