@@ -26,9 +26,12 @@ weights are `s=0` and `s=2`, `q=-plan.kappa:plan.kappa`, and
 """
 function scan_moments_cpu(
     plan::ScanMomentPlan{T},
-    angles::Angles,
+    angles::Angles;
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     _check_scan_moment_angles(plan, angles)
+    _check_hwp_moment_inputs((angles,), hwp_mode, demodulate_hwp)
     moments = zeros(
         Complex{T},
         2,
@@ -43,7 +46,8 @@ function scan_moments_cpu(
     @inbounds for sample_index in 1:angles.num
         alpha = T(angles.α[sample_index])
         alpha_plus_gamma = alpha + T(angles.γ[sample_index])
-        psi = T(angles.ψ[sample_index])
+        psi = T(demodulate_hwp ? _nominal_pol_angle(angles, sample_index) : angles.ψ[sample_index])
+        modulation = hwp_mode === :constant ? one(T) : T(_hwp_modulation(hwp_mode, angles.η[sample_index]))
         _chebyshev_values!(
             chebyshev,
             plan,
@@ -56,7 +60,7 @@ function scan_moments_cpu(
                 spin0_phase = cis(T(q) * alpha + n_phase)
                 spin2_phase = spin0_phase * cis(T(2) * psi)
                 for beta_index in 1:plan.beta_order
-                    weight = chebyshev[beta_index] * inverse_hits
+                    weight = (chebyshev[beta_index] * inverse_hits) * modulation
                     moments[1, beta_index, q_index, n_index] +=
                         weight * spin0_phase
                     moments[2, beta_index, q_index, n_index] +=

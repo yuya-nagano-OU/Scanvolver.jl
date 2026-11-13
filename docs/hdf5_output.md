@@ -43,7 +43,8 @@ subset = read_ring_hdf5(path, 1; skies=1:1, beams=1:2)
   `moment_method=:gemm`.
 - Pixels without hits, rings that were not requested, and pixels whose scan
   does not cover enough polarization angles (see `ring_stokes`) are `unseen`.
-- HWP and noise are rejected.
+- With `HWP=true`, use `prepare_hwp_blm` and a buffer carrying HWP angles;
+  see [HWP convolution](hwp_convolution.md). Noise is rejected.
 - With more than one device, start Julia with at least one thread per GPU.
 
 ### Runtime options
@@ -104,6 +105,10 @@ being extrapolated. The automatic range does not choose the Chebyshev order:
 `beta_order` is a setting, and it is stored in the file.
 
 ## Order of work
+
+With HWP, automatic batching uses the effective beam cutoff and counts one
+resident scan-moment set per active Fourier mode. Tiles share the same sky U
+across modes and stream one kernel K at a time.
 
 1. Each GPU holds all skies, the Wigner table and a ringD context.
 2. For each ring, the angles, the scan moments and ringD are built once, and

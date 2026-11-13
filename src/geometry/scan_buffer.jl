@@ -9,9 +9,9 @@ once per ring, which is fine for a single ring and hopeless for a sphere: a
 year of samples would be traversed `4*nside - 1` times. This bins every sample
 once instead.
 
-Only `phi`, `theta` and `psi` are retained, which is what the HWP-free
-convolution needs; supporting `HWP=true` would mean carrying sample times as a
-fourth array.
+The HWP path also retains a fourth per-sample array, `hwp_angle`, in the
+beam focal-plane frame. It is permuted with all three pointing arrays.
+HWP-free buffers keep this array empty.
 
 `pixel_offsets` is indexed relative to `first_pixel`, so a ring range much
 narrower than the sphere does not pay for the whole map. Samples inside one
@@ -31,7 +31,14 @@ struct RingScanBuffer
     theta::Vector{Float64}
     psi::Vector{Float64}
     pixel_offsets::Vector{Int}
+    hwp_angle::Vector{Float64}
 end
+
+# Keep the positional construction used when importing legacy HWP-free caches.
+RingScanBuffer(nside, first_ring, last_ring, first_pixel, last_pixel,
+               processed_samples, stored_samples, phi, theta, psi, offsets) =
+    RingScanBuffer(nside, first_ring, last_ring, first_pixel, last_pixel,
+                   processed_samples, stored_samples, phi, theta, psi, offsets, Float64[])
 
 Base.length(buffer::RingScanBuffer) = buffer.stored_samples
 
@@ -55,7 +62,7 @@ function ring_scan_buffer_bytes(buffer::RingScanBuffer)
     return sizeof(buffer.phi) +
         sizeof(buffer.theta) +
         sizeof(buffer.psi) +
-        sizeof(buffer.pixel_offsets)
+        sizeof(buffer.pixel_offsets) + sizeof(buffer.hwp_angle)
 end
 
 """
@@ -77,7 +84,7 @@ function ring_hit_count(buffer::RingScanBuffer, ring::Integer)
         buffer.pixel_offsets[first_pixel - buffer.first_pixel + 1]
 end
 
-function _grow_scan_arrays!(phi, theta, psi, pixels, required)
+function _grow_scan_arrays!(phi, theta, psi, pixels, required, eta=nothing)
     required <= length(phi) && return nothing
     capacity = length(phi)
     new_capacity = max(required, max(1024, capacity + capacity ÷ 2))
@@ -85,6 +92,7 @@ function _grow_scan_arrays!(phi, theta, psi, pixels, required)
     resize!(theta, new_capacity)
     resize!(psi, new_capacity)
     resize!(pixels, new_capacity)
+    eta === nothing || resize!(eta, new_capacity)
     return nothing
 end
 
@@ -103,6 +111,7 @@ function _sort_scan_by_pixel!(
     psi::Vector{Float64},
     pixels::Vector{Int32},
     counts::Vector{Int},
+    eta=nothing,
 )
     bucket_count = length(counts)
     offsets = Vector{Int}(undef, bucket_count + 1)
@@ -129,6 +138,9 @@ function _sort_scan_by_pixel!(
                 theta[destination], theta[position]
             psi[position], psi[destination] =
                 psi[destination], psi[position]
+            if eta !== nothing
+                eta[position], eta[destination] = eta[destination], eta[position]
+            end
             pixels[position], pixels[destination] =
                 pixels[destination], pixels[position]
             next_positions[bucket] = destination + 1
@@ -157,7 +169,9 @@ end
 
 Bin a scan into pixel order in one pass.
 
-`chunks` is any iterable of `(phi, theta, psi)` pointing chunks, so the caller
+`chunks` is an iterable of `(phi, theta, psi)` HWP-free chunks or named
+tuples carrying `hwp_angle` or absolute `time_array` for HWP scans.
+The caller
 decides how the time stream is produced and how large a chunk is; nothing about
 a scan strategy enters here. Samples outside `rings` are counted as processed
 and then discarded.
@@ -175,11 +189,9 @@ function build_ring_scan_buffer(
     rings::AbstractUnitRange{<:Integer}=1:ring_count(cp),
     capacity_hint::Union{Nothing,Integer}=nothing,
     progress_callback=nothing,
+    hwp_phase_rad::Real=0.0,
 )
-    cp.HWP == false || throw(ArgumentError(
-        "build_ring_scan_buffer currently supports HWP=false; sample times " *
-        "would have to be retained as a fourth array",
-    ))
+    isfinite(hwp_phase_rad) || throw(ArgumentError("hwp_phase_rad must be finite"))
     isempty(rings) && throw(ArgumentError("rings must be non-empty"))
     first_ring = Int(first(rings))
     last_ring = Int(last(rings))
@@ -192,20 +204,41 @@ function build_ring_scan_buffer(
     theta_store = Vector{Float64}(undef, capacity)
     psi_store = Vector{Float64}(undef, capacity)
     pixel_store = Vector{Int32}(undef, capacity)
+    eta_store = cp.HWP ? Vector{Float64}(undef, capacity) : nothing
     counts = zeros(Int, bucket_count)
 
     processed_samples = 0
     stored_samples = 0
     chunk_index = 0
     for chunk in chunks
-        phi, theta, psi = chunk
+        !cp.HWP && chunk isa NamedTuple && haskey(chunk, :hwp_angle) &&
+            throw(ArgumentError("hwp_angle requires HWP=true"))
+        phi, theta, psi = chunk isa NamedTuple ?
+            (chunk.phi, chunk.theta, chunk.psi) : chunk
         sample_count = _check_scan_chunk(phi, theta, psi)
+        eta_chunk = nothing
+        if cp.HWP
+            chunk isa NamedTuple && haskey(chunk, :hwp_angle) && haskey(chunk, :time_array) &&
+                throw(ArgumentError("provide hwp_angle or time_array, not both"))
+            if chunk isa NamedTuple && haskey(chunk, :hwp_angle)
+                eta_chunk = chunk.hwp_angle
+            else
+                times = chunk isa NamedTuple && haskey(chunk, :time_array) ?
+                    chunk.time_array : length(chunk) == 4 ? chunk[4] : nothing
+                times === nothing && throw(ArgumentError(
+                    "HWP chunks require hwp_angle or absolute time_array"))
+                eta_chunk = mod.((2π * cp.HWP_rpm / 60) .* Float64.(times) .+ hwp_phase_rad, 2π)
+            end
+            length(eta_chunk) == sample_count && all(isfinite, eta_chunk) ||
+                throw(ArgumentError("HWP chunk requires one finite angle per hit"))
+        end
         _grow_scan_arrays!(
             phi_store,
             theta_store,
             psi_store,
             pixel_store,
             stored_samples + sample_count,
+            eta_store,
         )
         next_position = stored_samples + 1
         @inbounds for sample_index in eachindex(phi, theta, psi)
@@ -218,6 +251,7 @@ function build_ring_scan_buffer(
             phi_store[next_position] = Float64(phi[sample_index])
             theta_store[next_position] = Float64(theta[sample_index])
             psi_store[next_position] = Float64(psi[sample_index])
+            eta_store === nothing || (eta_store[next_position] = mod(Float64(eta_chunk[sample_index]), 2π))
             bucket = pixel - first_pixel + 1
             pixel_store[next_position] = Int32(bucket)
             counts[bucket] += 1
@@ -238,12 +272,14 @@ function build_ring_scan_buffer(
     resize!(theta_store, stored_samples)
     resize!(psi_store, stored_samples)
     resize!(pixel_store, stored_samples)
+    eta_store === nothing || resize!(eta_store, stored_samples)
     offsets = _sort_scan_by_pixel!(
         phi_store,
         theta_store,
         psi_store,
         pixel_store,
         counts,
+        eta_store,
     )
 
     return RingScanBuffer(
@@ -258,6 +294,7 @@ function build_ring_scan_buffer(
         theta_store,
         psi_store,
         offsets,
+        eta_store === nothing ? Float64[] : eta_store,
     )
 end
 
@@ -271,11 +308,17 @@ function build_ring_scan_buffer(
     phi::AbstractVector{<:Real},
     theta::AbstractVector{<:Real},
     psi::AbstractVector{<:Real};
+    hwp_angle=nothing,
+    time_array=nothing,
     kwargs...,
 )
+    hwp_angle === nothing || time_array === nothing ||
+        throw(ArgumentError("provide hwp_angle or time_array, not both"))
+    chunk = hwp_angle !== nothing ? (; phi, theta, psi, hwp_angle) :
+        time_array !== nothing ? (; phi, theta, psi, time_array) : (phi, theta, psi)
     return build_ring_scan_buffer(
         cp,
-        ((phi, theta, psi),);
+        (chunk,);
         capacity_hint=length(phi),
         kwargs...,
     )
@@ -301,6 +344,8 @@ function make_ring_angles(
         "buffer was built at nside=$(buffer.nside); cp has " *
         "nside=$(cp.nside_output)",
     ))
+    cp.HWP && length(buffer.hwp_angle) != buffer.stored_samples &&
+        throw(ArgumentError("HWP buffer requires one angle per stored sample"))
     buffer.first_ring <= geometry.ring <= buffer.last_ring ||
         throw(ArgumentError(
             "ring $(geometry.ring) is outside the buffered range " *
@@ -325,6 +370,7 @@ function make_ring_angles(
                 φ=buffer.phi[span],
                 θ=buffer.theta[span],
                 ψ=buffer.psi[span],
+                hwp_angle=cp.HWP ? buffer.hwp_angle[span] : nothing,
             ),
         )
     end

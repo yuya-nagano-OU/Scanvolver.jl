@@ -78,6 +78,7 @@ function _scan_moment_chebyshev_psi_kernel!(
     psi2,
     beta,
     psi,
+    modulation,
     offsets,
     beta_order::Int32,
     beta_max::T,
@@ -109,7 +110,7 @@ function _scan_moment_chebyshev_psi_kernel!(
             _scan_moment_chebyshev_value(
                 beta_index - Int32(1),
                 x,
-            )
+            ) * _sample_modulation(modulation, hit_index, T)
     end
     return nothing
 end
@@ -216,7 +217,7 @@ function _scan_moments_gemm_shape(
 end
 
 """
-    scan_moments_gemm_memory_bytes(plan, angles) -> Int128
+    scan_moments_gemm_memory_bytes(plan, angles; hwp_mode, demodulate_hwp) -> Int128
 
 Return the estimated peak device bytes required by
 `scan_moments_gemm_gpu`, including the returned output, packed angles, and
@@ -224,18 +225,21 @@ padded GEMM workspaces.
 """
 function scan_moments_gemm_memory_bytes(
     plan::ScanMomentPlan{T},
-    angles::AbstractVector{<:Angles},
+    angles::AbstractVector{<:Angles};
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     q_count, n_count, max_hits, pixel_count =
         _scan_moments_gemm_shape(plan, angles)
     total_hits = sum(Int128(angle.num) for angle in angles)
+    _check_hwp_moment_inputs(angles, hwp_mode, demodulate_hwp)
     real_bytes = Int128(sizeof(T))
     complex_bytes = Int128(sizeof(Complex{T}))
     int32_bytes = Int128(sizeof(Int32))
     padded_hits = Int128(max_hits) * pixel_count
 
     packed_bytes =
-        Int128(4) * total_hits * real_bytes +
+        Int128(hwp_mode === :constant ? 4 : 5) * total_hits * real_bytes +
         (Int128(pixel_count) + 1) * int32_bytes
     output_bytes =
         Int128(2) * plan.beta_order * q_count * n_count *
@@ -251,7 +255,7 @@ function scan_moments_gemm_memory_bytes(
 end
 
 """
-    scan_moments_gemm_gpu(plan, angles) -> CuArray{Complex{T},5}
+    scan_moments_gemm_gpu(plan, angles; hwp_mode, demodulate_hwp) -> CuArray{Complex{T},5}
 
 Construct scan moments with reusable phase tables and one strided batched
 GEMM per `(scan_weight, beta_mode)`. Pixels are padded to the largest hit
@@ -260,7 +264,9 @@ use `scan_moments_gpu` for automatic memory-aware recovery.
 """
 function scan_moments_gemm_gpu(
     plan::ScanMomentPlan{T},
-    angles::AbstractVector{<:Angles},
+    angles::AbstractVector{<:Angles};
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     CUDA.functional() || throw(ArgumentError(
         "CUDA.jl is loaded but no functional GPU is available",
@@ -278,7 +284,7 @@ function scan_moments_gemm_gpu(
     output = nothing
     completed = false
     try
-        packed = _PackedScanMomentAngles(angles, T)
+        packed = _PackedScanMomentAngles(angles, T; hwp_mode, demodulate_hwp)
         phase_q = CUDA.zeros(
             Complex{T},
             q_count,
@@ -356,6 +362,7 @@ function scan_moments_gemm_gpu(
             psi2,
             packed.beta,
             packed.psi,
+            packed.modulation,
             packed.offsets,
             Int32(plan.beta_order),
             plan.beta_max,
@@ -442,6 +449,8 @@ function scan_moments_gpu(
     method::Symbol=:gemm,
     fallback_to_direct::Bool=true,
     memory_fraction::Real=0.8,
+    hwp_mode::Symbol=:constant,
+    demodulate_hwp::Bool=false,
 ) where {T<:_CHEBYSHEV_PRECISIONS}
     method in (:gemm, :direct) || throw(ArgumentError(
         "method must be :gemm or :direct; got $method",
@@ -452,7 +461,7 @@ function scan_moments_gpu(
         ))
     method === :direct && return scan_moments_direct_gpu(
         plan,
-        angles,
+        angles; hwp_mode, demodulate_hwp,
     )
 
     CUDA.functional() || throw(ArgumentError(
@@ -470,10 +479,10 @@ function scan_moments_gpu(
             "GEMM scan moments require at least one hit",
         ))
         @warn "GEMM scan moments received no hits; falling back to direct GPU path"
-        return scan_moments_direct_gpu(plan, angles)
+        return scan_moments_direct_gpu(plan, angles; hwp_mode, demodulate_hwp)
     end
 
-    required_bytes = scan_moments_gemm_memory_bytes(plan, angles)
+    required_bytes = scan_moments_gemm_memory_bytes(plan, angles; hwp_mode, demodulate_hwp)
     available_bytes = _available_device_bytes()
     budget_bytes = floor(
         Int128,
@@ -485,16 +494,16 @@ function scan_moments_gpu(
             "the configured budget $budget_bytes bytes",
         ))
         @warn "GEMM scan moments exceed the memory budget; falling back to direct GPU path" required_bytes budget_bytes
-        return scan_moments_direct_gpu(plan, angles)
+        return scan_moments_direct_gpu(plan, angles; hwp_mode, demodulate_hwp)
     end
 
     try
-        return scan_moments_gemm_gpu(plan, angles)
+        return scan_moments_gemm_gpu(plan, angles; hwp_mode, demodulate_hwp)
     catch error
         if fallback_to_direct && error isa CUDA.OutOfGPUMemoryError
             CUDA.reclaim()
             @warn "GEMM scan moments ran out of GPU memory; falling back to direct GPU path" exception=(error, catch_backtrace())
-            return scan_moments_direct_gpu(plan, angles)
+            return scan_moments_direct_gpu(plan, angles; hwp_mode, demodulate_hwp)
         end
         rethrow()
     end

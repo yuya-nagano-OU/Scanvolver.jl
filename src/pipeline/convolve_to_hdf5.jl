@@ -21,7 +21,7 @@ function prepare_context(cp, alm, table, device, T)
         device_table = upload_wigner_table_gpu(table)
         context = ringd_context(cp; precision=T)
         CUDA.synchronize()
-        return (device=device, alm=device_alm, table=device_table, ringd=context)
+        return (device=device, alm=device_alm, table=device_table, ringd=context, geometry_cp=cp)
     catch
         context === nothing || free_ringd_context!(context)
         if device_table !== nothing
@@ -120,7 +120,9 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
     T = typeof(plan.beta_max)
     started_ns = time_ns()
     geometry = ring_geometry(cp, ring)
-    active = moments = nothing
+    active = nothing
+    moments = []
+    geometry_cp = context.geometry_cp
     accumulators = CuArray{Complex{T},4}[]
     plan_cache = _SkyRingFFTPlanCache()
     try
@@ -139,8 +141,8 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
         end
         positions = Int.(Array(active.positions))
         pixels = geometry.first_pixel .+ positions .- 1
-        ringd = ringd_blocks_recursion_gpu!(context.ringd, cp, geometry.theta)
-        moments = scan_moments_gpu(plan, angles; method=moment_method,
+        ringd = ringd_blocks_recursion_gpu!(context.ringd, geometry_cp, geometry.theta)
+        moments = _pipeline_moments(plan, angles, batches[1].blm; method=moment_method,
                                    memory_fraction=memory_fraction)
         accumulator_bytes(cp, T, length(active)) <= memory_fraction * Float64(_available_device_bytes()) ||
             throw(ArgumentError("ring $ring: all-beam ring accumulators exceed the memory budget"))
@@ -148,7 +150,7 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
             push!(accumulators, CUDA.zeros(Complex{T}, cp.numofsky,
                   length(batch.indices), length(active), 2))
         end
-        cp_batch = ConvolutionParams(cp; numofbeam=maximum(length(b.indices) for b in batches))
+        cp_batch = ConvolutionParams(geometry_cp; numofbeam=maximum(length(b.indices) for b in batches))
         selected, selected_bytes = select_tile(cp_batch, geometry, active, T, l_tile,
                                                max_l_tile, memory_fraction; count_fft)
         # The model and the cuFFT estimate size the tile; should the device still
@@ -166,19 +168,29 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
                 l_last = min(l_first + width - 1, cp.lstop)
                 kernel = sky = active_sky = nothing
                 try
-                    kernel = build_effective_kernel_gpu(context.table, moments, l_first, l_last)
                     sky = build_sky_ring_gpu(
-                        cp, ringd, context.alm, geometry.phi_pixels, l_first, l_last;
+                        geometry_cp, ringd, context.alm, geometry.phi_pixels, l_first, l_last;
                         plan_cache=plan_cache,
                     )
                     active_sky = select_active_sky_ring_gpu(sky, active)
-                    for (batch, accumulator) in zip(batches, accumulators)
-                        effective = nothing
+                    # Stream one Fourier kernel at a time; the sky tile is shared
+                    # by all HWP components and all beam batches.
+                    for (j, moment) in enumerate(moments)
+                        kernel = build_effective_kernel_gpu(context.table, moment, l_first, l_last)
                         try
-                            effective = apply_beams_gemm_gpu(context.table, kernel, batch.blm, l_first, l_last)
-                            accumulate_convolution_tile_gemm_gpu!(accumulator, active_sky, effective)
+                            for (batch, accumulator) in zip(batches, accumulators)
+                                effective = nothing
+                                try
+                                    effective = apply_beams_gemm_gpu(context.table, kernel,
+                                        _beam_component(batch.blm, j), l_first, l_last)
+                                    accumulate_convolution_tile_gemm_gpu!(accumulator, active_sky, effective)
+                                finally
+                                    effective === nothing || CUDA.unsafe_free!(effective)
+                                end
+                            end
                         finally
-                            effective === nothing || CUDA.unsafe_free!(effective)
+                            CUDA.unsafe_free!(kernel)
+                            kernel = nothing
                         end
                     end
                     tile_count += 1
@@ -203,15 +215,15 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
         finish_ring!(writer, merge((
             ring=ring, device=context.device, observed_beta_max=observed,
             hit_count=hits, active_pixels=length(active), l_tile=width, tile_count=tile_count,
-            scan_moment_builds=1, ringd_builds=1, sky_fft_builds=tile_count,
-            kernel_builds=tile_count, beam_applications=tile_count * length(batches),
+            scan_moment_builds=length(moments), ringd_builds=1, sky_fft_builds=tile_count,
+            kernel_builds=tile_count * length(moments), beam_applications=tile_count * length(batches) * length(moments),
             estimated_tile_bytes=Int64(tile_bytes), tile_retries=tile_retries,
         ), extra_record(layout, cp, T, length(active), batches)), progress_callback; started_ns)
     finally
         CUDA.synchronize()
         _release_sky_ring_fft_plans!(plan_cache)
         foreach(CUDA.unsafe_free!, accumulators)
-        moments === nothing || CUDA.unsafe_free!(moments)
+        foreach(CUDA.unsafe_free!, moments)
         active === nothing || CUDA.unsafe_free!(active.positions)
     end
     return nothing
@@ -221,10 +233,13 @@ end
 Check what every layout needs; return the ring list, the device list and the
 absolute output path.
 """
-function check_run_inputs(cp, buffer, alm::PreparedAlm{T}, blm::PreparedBlm{T};
+function check_run_inputs(cp, buffer, alm::PreparedAlm{T}, blm::Union{PreparedBlm{T},PreparedHWPBlm{T}};
                           map_precision, rings, devices, output_path, l_tile, max_l_tile,
                           memory_fraction, rcond, unseen, reclaim_interval) where {T}
-    cp.HWP && throw(ArgumentError("HWP is not supported"))
+    cp.HWP == (blm isa PreparedHWPBlm) ||
+        throw(ArgumentError("HWP=true requires PreparedHWPBlm; HWP=false requires PreparedBlm"))
+    cp.HWP && length(buffer.hwp_angle) != buffer.stored_samples &&
+        throw(ArgumentError("HWP scan buffer requires one angle per stored sample"))
     cp.noise && throw(ArgumentError("noise is not supported"))
     T in (Float32, Float64) && map_precision in (Float32, Float64) ||
         throw(ArgumentError("compute/map precision must be Float32 or Float64"))
@@ -285,15 +300,18 @@ end
 Beams per batch: the given positive count of `multiple`-beam units, or with
 `:auto` the choice of `plan_beam_batches` for the tightest device.
 """
-function resolve_batch_size(setting, cp, T, device_list; multiple=1, beta_order, l_tile,
+function resolve_batch_size(setting, cp, blm, T, device_list; multiple=1, beta_order, l_tile,
                             max_l_tile, memory_fraction)
     if setting !== :auto
         setting isa Integer && setting > 0 ||
             throw(ArgumentError("batch size must be :auto or a positive integer"))
         return Int(setting)
     end
-    plan = plan_beam_batches(cp, T; available_bytes=available_bytes_on(device_list),
-                             memory_fraction, l_tile, max_l_tile, beta_order, multiple)
+    geometry_cp = _geometry_params(cp, blm)
+    moment_count = blm isa PreparedHWPBlm ? length(blm.modes) : 1
+    plan = plan_beam_batches(geometry_cp, T; available_bytes=available_bytes_on(device_list),
+                             memory_fraction, l_tile, max_l_tile, beta_order, multiple,
+                             moment_count)
     return plan.batch_size ÷ multiple
 end
 
@@ -306,15 +324,16 @@ function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, 
                    moment_method, map_precision, rcond, unseen, reclaim_interval,
                    sky_ids, metadata, batch_callback, progress_callback,
                    batch_size_setting="manual") where {T}
-    plan = automatic_scan_plan(cp; beta_order, precision=T)
-    table = build_wigner_chebyshev_table_cpu(cp, plan)
+    geometry_cp = _geometry_params(cp, blm)
+    plan = automatic_scan_plan(geometry_cp; beta_order, precision=T)
+    table = build_wigner_chebyshev_table_cpu(geometry_cp, plan)
     fraction, count_fft = resolve_memory_fraction(memory_fraction)
     tile_cap = resolve_max_l_tile(max_l_tile, cp.lstop - cp.lstart + 1)
     contexts = []
     try
         # Serial first-use CUDA setup avoids concurrent context initialization.
         for device in device_list
-            push!(contexts, prepare_context(cp, alm, table, device, T))
+            push!(contexts, prepare_context(geometry_cp, alm, table, device, T))
         end
         h5open(path, "w") do file
             writer = make_writer(file, layout, cp, plan, ring_list, T, map_precision,
@@ -324,6 +343,16 @@ function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, 
                                     batch_size_setting,
                                     max_l_tile_setting=max_l_tile === :auto ? "auto" : "manual",
                                     memory_fraction_setting=memory_fraction === :auto ? "auto" : "manual"))
+            if blm isa PreparedHWPBlm
+                attributes(file)["hwp_angle_frame"] = "beam focal plane"
+                attributes(file)["hwp_demodulation"] = "2psi+4eta"
+                attributes(file)["hwp_effective_bnmax"] = blm.effective_bnmax
+                attributes(file)["hwp_lowell"] = string(blm.lowell_hwp)
+                attributes(file)["hwp_mueller_julia_axes"] = "output_Stokes,input_Stokes"
+                attributes(file)["hwp_mueller_disk_axes"] = "input_Stokes,output_Stokes"
+                file["hwp_mueller_iquv"] = blm.mueller
+                file["hwp_fourier_modes"] = string.(blm.modes)
+            end
             next_ring = Threads.Atomic{Int}(1)
             failed = Threads.Atomic{Bool}(false)
             try
@@ -396,7 +425,7 @@ array after writing it, before that ring is marked complete. No full map is
 allocated or returned. Returns the absolute output path.
 """
 function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
-                         alm::PreparedAlm{T}, blm::PreparedBlm{T};
+                         alm::PreparedAlm{T}, blm::Union{PreparedBlm{T},PreparedHWPBlm{T}};
                          output_path::AbstractString, beam_batch_size=:auto,
                          devices=[0], rings=buffer.first_ring:buffer.last_ring,
                          beta_order::Integer=8, l_tile=:auto, max_l_tile=:auto,
@@ -409,7 +438,7 @@ function convolve_to_hdf5(cp::ConvolutionParams, buffer::RingScanBuffer,
     ring_list, device_list, path = check_run_inputs(
         cp, buffer, alm, blm; map_precision, rings, devices, output_path, l_tile,
         max_l_tile, memory_fraction, rcond, unseen, reclaim_interval)
-    batch_size = resolve_batch_size(beam_batch_size, cp, T, device_list; beta_order, l_tile,
+    batch_size = resolve_batch_size(beam_batch_size, cp, blm, T, device_list; beta_order, l_tile,
                                     max_l_tile, memory_fraction)
     length(sky_ids) == cp.numofsky && length(beam_ids) == cp.numofbeam || throw(ArgumentError("ID counts do not match cp"))
     for (key, values) in beam_metadata

@@ -241,15 +241,18 @@ function select_tile(cp_batch, geometry, active, T, l_tile, max_l_tile, fraction
 end
 
 """
-    resident_ring_bytes(cp, precision; beta_order=8) -> Int128
+    resident_ring_bytes(cp, precision; beta_order=8, moment_count=1) -> Int128
 
 Device bytes that stay allocated while the `l` tiles of the widest ring
 (`4 * nside_output` pixels, all hit) are processed: the uploaded skies and
 Wigner-Chebyshev table, the ringD plan and stack, the scan moments and the
 accumulators of every beam. The table term is an upper bound, since it counts
-every `(M, n)` pair of the `kappa` band at every `l`.
+every `(M, n)` pair of the `kappa` band at every `l`. `moment_count` is the
+number of resident scan-moment sets (the active Fourier modes with HWP).
 """
-function resident_ring_bytes(cp::ConvolutionParams, precision::Type; beta_order::Integer=8)
+function resident_ring_bytes(cp::ConvolutionParams, precision::Type; beta_order::Integer=8,
+                             moment_count::Integer=1)
+    moment_count > 0 || throw(ArgumentError("moment_count must be positive"))
     pixels = 4 * cp.nside_output
     complex_bytes = Int128(2 * sizeof(precision))
     l_count = Int128(cp.lstop - cp.lstart + 1)
@@ -257,7 +260,7 @@ function resident_ring_bytes(cp::ConvolutionParams, precision::Type; beta_order:
     M_count = Int128(2 * calc_Mmax(cp, cp.lstop) + 1)
     delta_count = Int128(2 * cp.κ + 1)
     ring = ring_memory_bytes(cp, pixels, pixels, 1; precision)
-    moments = Int128(2) * beta_order * delta_count * n_count * pixels * complex_bytes
+    moments = Int128(2) * beta_order * delta_count * n_count * pixels * complex_bytes * moment_count
     alm = Int128(2 * cp.lstop + 1) * 3 * cp.numofsky * l_count * complex_bytes
     table = Int128(beta_order) * delta_count * n_count * l_count * sizeof(precision) +
             M_count * n_count * sizeof(Int32)
@@ -266,9 +269,10 @@ end
 
 """
     plan_beam_batches(cp, precision; available_bytes, memory_fraction=:auto,
-                      l_tile=:auto, max_l_tile=:auto, beta_order=8, multiple=1)
+                      l_tile=:auto, max_l_tile=:auto, beta_order=8, multiple=1, moment_count=1)
 
-Choose how many beams to apply together, from the memory model alone.
+Choose how many beams to apply together, from the memory model alone. With
+HWP, pass the effective geometry parameters and the active `moment_count`.
 
 The plan is made for the widest ring (`4 * nside_output` pixels, all hit, with
 the gathered sky copy of an incomplete ring), so it holds for every other ring.
@@ -298,7 +302,8 @@ of beams and one multipole fit.
 function plan_beam_batches(cp::ConvolutionParams, precision::Type;
                            available_bytes::Integer, memory_fraction=:auto,
                            l_tile=:auto, max_l_tile=:auto,
-                           beta_order::Integer=8, multiple::Integer=1)
+                           beta_order::Integer=8, multiple::Integer=1,
+                           moment_count::Integer=1)
     precision in (Float32, Float64) || throw(ArgumentError(
         "precision must be Float32 or Float64, got $precision"))
     fraction, count_fft = resolve_memory_fraction(memory_fraction)
@@ -309,7 +314,7 @@ function plan_beam_batches(cp::ConvolutionParams, precision::Type;
 
     pixels = 4 * cp.nside_output
     l_count = cp.lstop - cp.lstart + 1
-    resident = resident_ring_bytes(cp, precision; beta_order)
+    resident = resident_ring_bytes(cp, precision; beta_order, moment_count)
     budget = floor(Int128, fraction * Float64(max(Int128(available_bytes) - resident, 0)))
     count_fft && (budget -= _CUFFT_PLAN_OVERHEAD_BYTES)
 

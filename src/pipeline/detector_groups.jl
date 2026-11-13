@@ -18,7 +18,7 @@ function normalized_detector_weights(offsets, weights)
 end
 
 """Split prepared beams into batches containing only complete detector groups."""
-function detector_group_batches(blm::PreparedBlm, detectors_per_group::Integer,
+function detector_group_batches(blm::Union{PreparedBlm,PreparedHWPBlm}, detectors_per_group::Integer,
                                 group_batch_size::Integer)
     detectors_per_group > 0 || throw(ArgumentError("detectors_per_group must be positive"))
     group_batch_size > 0 || throw(ArgumentError("group_batch_size must be positive"))
@@ -46,7 +46,7 @@ averaged directly; the spin-2 scan weight is averaged after multiplication by
 `(sky, detector_group, active_pixel, scan_weight)`.
 """
 function reduce_detector_accumulators(values::AbstractArray{Complex{T},4},
-                                      detector_offsets, detector_weights) where {T}
+                                      detector_offsets, detector_weights; hwp::Bool=false) where {T}
     detector_count = length(detector_offsets)
     normalized = normalized_detector_weights(detector_offsets, detector_weights)
     size(values, 4) == 2 || throw(DimensionMismatch("the scan-weight axis must have length 2"))
@@ -58,7 +58,7 @@ function reduce_detector_accumulators(values::AbstractArray{Complex{T},4},
     for group in 1:group_count, detector in 1:detector_count
         source = (group - 1) * detector_count + detector
         weight0 = T(normalized[detector])
-        weight2 = Complex{T}(normalized[detector] * cis(2 * detector_offsets[detector]))
+        weight2 = Complex{T}(normalized[detector] * cis((hwp ? -2 : 2) * detector_offsets[detector]))
         @views grouped[:, group, :, 1] .+= weight0 .* values[:, source, :, 1]
         @views grouped[:, group, :, 2] .+= weight2 .* values[:, source, :, 2]
     end
@@ -95,10 +95,10 @@ function grouped_ring_stokes(grouped::AbstractArray{Complex{T},4}, angles,
     for active_index in 1:active_count
         angle = angles[active_index]
         angle.num == 0 && continue
-        base_h2 = sum(cis(2 * psi) for psi in angle.ψ) / angle.num
-        base_h4 = sum(cis(4 * psi) for psi in angle.ψ) / angle.num
-        h2 = base_h2 * phase2_mean
-        h4 = base_h4 * phase4_mean
+        base_h2 = sum(cis(2 * _nominal_pol_angle(angle, i)) for i in 1:angle.num) / angle.num
+        base_h4 = sum(cis(4 * _nominal_pol_angle(angle, i)) for i in 1:angle.num) / angle.num
+        h2 = base_h2 * (_has_hwp_angles(angle) ? conj(phase2_mean) : phase2_mean)
+        h4 = base_h4 * (_has_hwp_angles(angle) ? conj(phase4_mean) : phase4_mean)
         h_matrix = ComplexF64[
             1.0              0.5*conj(h2)       0.5*h2
             0.5*h2           0.25               0.25*h4
@@ -139,7 +139,8 @@ output_name(::DetectorGroupMaps) = :groups
 
 function batch_stokes(layout::DetectorGroupMaps, accumulator, geometry, positions, pixels,
                       angles; rcond, unseen, map_precision)
-    grouped = reduce_detector_accumulators(Array(accumulator), layout.offsets, layout.weights)
+    grouped = reduce_detector_accumulators(Array(accumulator), layout.offsets, layout.weights;
+                                           hwp=any(_has_hwp_angles, angles))
     return grouped_ring_stokes(grouped, angles, layout.offsets, layout.weights;
                                rcond, unseen, precision=map_precision)
 end
@@ -186,7 +187,7 @@ work as in `convolve_to_hdf5`, in whole detector groups. The default group order
 """
 function convolve_detector_groups_to_hdf5(
     cp::ConvolutionParams, buffer::RingScanBuffer,
-    alm::PreparedAlm{T}, blm::PreparedBlm{T};
+    alm::PreparedAlm{T}, blm::Union{PreparedBlm{T},PreparedHWPBlm{T}};
     output_path::AbstractString, group_batch_size=:auto,
     detector_labels=DEFAULT_DETECTOR_LABELS,
     detector_offsets=DEFAULT_DETECTOR_OFFSETS,
@@ -215,7 +216,7 @@ function convolve_detector_groups_to_hdf5(
     ring_list, device_list, path = check_run_inputs(
         cp, buffer, alm, blm; map_precision, rings, devices, output_path, l_tile,
         max_l_tile, memory_fraction, rcond, unseen, reclaim_interval)
-    batch_size = resolve_batch_size(group_batch_size, cp, T, device_list;
+    batch_size = resolve_batch_size(group_batch_size, cp, blm, T, device_list;
                                     multiple=detector_count, beta_order, l_tile,
                                     max_l_tile, memory_fraction)
     length(sky_ids) == cp.numofsky || throw(ArgumentError("sky ID count does not match cp"))
