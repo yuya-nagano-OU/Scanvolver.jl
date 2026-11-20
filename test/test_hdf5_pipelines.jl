@@ -251,8 +251,9 @@ end
                 estimate = sky_ring_fft_workspace_bytes(T, 4, 300, pixel_count)
                 @test estimate in (0, sizeof(values))
                 @test taken <= estimate + Scanvolver._CUFFT_PLAN_OVERHEAD_BYTES
-                finalize(fft_plan.p)
+                Scanvolver._release_fft_plans!((fft_plan,))
                 empty!(CUDA.CUFFT.idle_handles)
+                @test isempty(CUDA.CUFFT.idle_handles.idle_handles)
                 CUDA.unsafe_free!(values)
             end
             @test sky_ring_fft_workspace_bytes(Float32, 4, 300, 2044) == 4 * 300 * 2044 * 8

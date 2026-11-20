@@ -27,13 +27,31 @@ function _sky_ring_ifft!(sky_ring, cache::_SkyRingFFTPlanCache)
     return sky_ring
 end
 
-function _release_sky_ring_fft_plans!(cache::_SkyRingFFTPlanCache)
-    CUDA.synchronize()
-    for fft_plan in values(cache.plans)
+# The module that defines CUDA.jl's library handle caches (CUDACore).
+const _CUDA_HANDLE_MODULE = parentmodule(typeof(CUDA.CUFFT.idle_handles))
+
+# Release cuFFT plans and return their native handles to cuFFT.jl's idle
+# cache before the caller purges it. Up to CUDA.jl 6.4, `finalize` releases a
+# plan directly. From CUDA.jl 6.5 the plan's finalizer only queues the release,
+# which runs when CUDA.jl next drains retired resources (a bounded drain on
+# allocation or synchronization), so drain them all here. `finalize` also
+# removes the finalizer: calling the plan's `unsafe_free!` instead would leave
+# it to release the plan a second time.
+function _release_fft_plans!(fft_plans)
+    for fft_plan in fft_plans
         finalize(fft_plan.p)
     end
+    if isdefined(_CUDA_HANDLE_MODULE, :drain_retired)
+        _CUDA_HANDLE_MODULE.drain_retired()
+    end
+    return nothing
+end
+
+function _release_sky_ring_fft_plans!(cache::_SkyRingFFTPlanCache)
+    CUDA.synchronize()
+    _release_fft_plans!(values(cache.plans))
     empty!(cache.plans)
-    # Finalizing a plan returns its native handle to cuFFT.jl's global cache.
+    # Releasing a plan returns its native handle to cuFFT.jl's global cache.
     # The cache key contains the complete input shape, so polar rings would
     # otherwise retain a separate workspace for every pixel count.  cuFFT.jl
     # 6.3.1 does not register this cache with CUDA.reclaim(), hence the
@@ -251,8 +269,8 @@ function build_sky_ring_gpu(
     finally
         if fft_plan !== nothing
             CUDA.synchronize()
-            finalize(fft_plan.p)
-            # `finalize` only makes the native handle idle.  A standalone
+            _release_fft_plans!((fft_plan,))
+            # Releasing only makes the native handle idle.  A standalone
             # caller has no ring cache whose release would destroy it.
             empty!(CUDA.CUFFT.idle_handles)
         end
