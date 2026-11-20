@@ -1,7 +1,9 @@
 # Scalar effective-beam ell=0,1 coefficients from polarized input beam ell1>=2.
 # The spatial Mueller mode is uniform in the beam-centred Ludwig-3 frame.
-# For harmonic t=+/-2, its spherical-frame factor is exp(i*t*phi), so the
-# polarized beam order is n-t. No spin-2 coefficient at ell<2 is introduced.
+# For the beam-order shift t=sigma[X]-sigma[I]=+/-2, its spherical-frame factor
+# is exp(i*t*phi), so the polarized beam order is n-t. The shift does not
+# depend on the HWP harmonic of the Mueller entry. No spin-2 coefficient at
+# ell<2 is introduced.
 
 function _hwp_lowell_weights(ell::Int, n::Int, t::Int, lmax::Int)
     weights = zeros(Float64, lmax + 1)
@@ -31,33 +33,35 @@ end
     return phase * (t == 2 ? minus : plus)
 end
 
-function _prepare_hwp_lowell(cp, blms, input_basis, C, ::Type{T}) where {T}
-    result = Dict{Int,NTuple{2,Matrix{Complex{T}}}}()
+# `channels` holds the complex coefficients of the five HWP modulation
+# functions (see `_rotating_channels`). The spatial projection depends only on
+# the beam-order shift t, so it is computed once and shared by every channel.
+function _prepare_hwp_lowell(cp, blms, input_basis, channels, ::Type{T}) where {T}
+    result = Dict{Int,NTuple{length(_HWP_MODES),Matrix{Complex{T}}}}()
     for ell in cp.lstart:min(1, cp.lstop)
-        cosine = zeros(Complex{T}, 2ell + 1, cp.numofbeam)
-        sine = similar(cosine)
-        fill!(sine, 0)
+        blocks = ntuple(_ -> zeros(Complex{T}, 2ell + 1, cp.numofbeam), length(_HWP_MODES))
         for (X, t) in ((2, 2), (3, -2))
-            iszero(C[X, 1]) && continue
-            factor = C[X, 1] / sqrt(2.0)
+            any(channel -> !iszero(channel[X, 1]), channels) || continue
+            factors = map(channel -> channel[X, 1] / sqrt(2.0), channels)
             for n in -ell:ell
                 abs(n - t) <= cp.bnmax || continue
                 weights = _hwp_lowell_weights(ell, n, t, cp.lmax)
                 for beam in eachindex(blms)
-                    value = zero(ComplexF64)
+                    projection = zero(ComplexF64)
                     for ell1 in max(2, abs(n - t)):cp.lmax
-                        value += weights[ell1 + 1] * _hwp_lowell_source(
+                        projection += weights[ell1 + 1] * _hwp_lowell_source(
                             blms[beam], ell1, n, t, cp.lmax, input_basis,
                         )
                     end
-                    value *= factor
                     row = n + ell + 1
-                    cosine[row, beam] += Complex{T}(value)
-                    sine[row, beam] += Complex{T}((t > 0 ? im : -im) * value)
+                    for j in eachindex(blocks)
+                        iszero(factors[j]) && continue
+                        blocks[j][row, beam] += Complex{T}(projection * factors[j])
+                    end
                 end
             end
         end
-        result[ell] = (cosine, sine)
+        result[ell] = blocks
     end
     return result
 end

@@ -76,7 +76,7 @@ to an HDF5 file ring by ring.
 
 ## Documentation
 
-- [Rotating HWP convolution](docs/hwp_convolution.md): Mueller mixing, the `2ψ+4η` convention, phase-bearing scans, and V=0 scope.
+- [Rotating HWP convolution](docs/hwp_convolution.md): Mueller mixing, 0f/2f/4f focal-plane Mueller tables in the form of Patanchon et al., the `2ψ+4η` convention, phase-bearing scans, and V=0 scope.
 - [Kappa estimation](docs/kappa_estimation.md): choose a candidate Fourier band
   with `estimate_kappa(; nside, lmax, nmax)` on the CPU (default `ε=1e-5`,
   optionally the sole positional argument), including
@@ -106,7 +106,7 @@ Current limitations:
 
 - Production convolution requires CUDA; CUDA is not an optional dependency in
   this development release.
-- Rotating HWP/Mueller convolution supports TEB inputs with V=0; use `prepare_hwp_blm` for HWP runs.
+- Rotating HWP/Mueller convolution supports TEB inputs with V=0; use `prepare_hwp_blm` for HWP runs, with either a rotating matrix (`mueller`) or 0f/2f/4f tables (`mueller_0f`, `mueller_2f`, `mueller_4f`). One table applies to all beams in a call.
 - The HDF5 drivers record which rings are complete but do not resume an
   interrupted run.
 - Julia versions older than 1.12 have not yet been validated.

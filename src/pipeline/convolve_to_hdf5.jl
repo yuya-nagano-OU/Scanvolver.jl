@@ -230,6 +230,38 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
 end
 
 """
+Record the HWP model of `blm` in an open HDF5 file.
+
+`hwp_response` is `rotating` for a fixed HWP-frame matrix (`hwp_mueller_iquv`)
+and `fourier` for the 0f/2f/4f focal-plane tables (`hwp_mueller_0f_iquv`,
+`hwp_mueller_{2f,4f}_{amplitude,phase}_iquv`). Every matrix is 4x4 IQUV.
+"""
+function write_hwp_provenance(file, blm::PreparedHWPBlm)
+    attributes(file)["hwp_angle_frame"] = "beam focal plane"
+    attributes(file)["hwp_demodulation"] = "2psi+4eta"
+    attributes(file)["hwp_effective_bnmax"] = blm.effective_bnmax
+    attributes(file)["hwp_lowell"] = string(blm.lowell_hwp)
+    attributes(file)["hwp_mueller_julia_axes"] = "output_Stokes,input_Stokes"
+    attributes(file)["hwp_mueller_disk_axes"] = "input_Stokes,output_Stokes"
+    if blm.mueller_fourier === nothing
+        attributes(file)["hwp_response"] = "rotating"
+        file["hwp_mueller_iquv"] = blm.mueller
+    else
+        table = blm.mueller_fourier
+        attributes(file)["hwp_response"] = "fourier"
+        attributes(file)["hwp_mueller_formula"] =
+            "M(eta) = M0f + sum_{n=2,4} A_nf .* cos.(n*eta .+ phi_nf), phases in radians"
+        file["hwp_mueller_0f_iquv"] = table.mueller_0f
+        file["hwp_mueller_2f_amplitude_iquv"] = table.mueller_2f.amplitude
+        file["hwp_mueller_2f_phase_iquv"] = table.mueller_2f.phase
+        file["hwp_mueller_4f_amplitude_iquv"] = table.mueller_4f.amplitude
+        file["hwp_mueller_4f_phase_iquv"] = table.mueller_4f.phase
+    end
+    file["hwp_fourier_modes"] = string.(blm.modes)
+    return nothing
+end
+
+"""
 Check what every layout needs; return the ring list, the device list and the
 absolute output path.
 """
@@ -343,16 +375,7 @@ function run_rings(layout, cp, buffer, alm::PreparedAlm{T}, blm, batches, path, 
                                     batch_size_setting,
                                     max_l_tile_setting=max_l_tile === :auto ? "auto" : "manual",
                                     memory_fraction_setting=memory_fraction === :auto ? "auto" : "manual"))
-            if blm isa PreparedHWPBlm
-                attributes(file)["hwp_angle_frame"] = "beam focal plane"
-                attributes(file)["hwp_demodulation"] = "2psi+4eta"
-                attributes(file)["hwp_effective_bnmax"] = blm.effective_bnmax
-                attributes(file)["hwp_lowell"] = string(blm.lowell_hwp)
-                attributes(file)["hwp_mueller_julia_axes"] = "output_Stokes,input_Stokes"
-                attributes(file)["hwp_mueller_disk_axes"] = "input_Stokes,output_Stokes"
-                file["hwp_mueller_iquv"] = blm.mueller
-                file["hwp_fourier_modes"] = string.(blm.modes)
-            end
+            blm isa PreparedHWPBlm && write_hwp_provenance(file, blm)
             next_ring = Threads.Atomic{Int}(1)
             failed = Threads.Atomic{Bool}(false)
             try

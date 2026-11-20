@@ -40,6 +40,47 @@ I/Q/U leakage, and bins into the nominal ideal-HWP IQU basis; it does not
 invert the non-ideal Mueller matrix in the map-maker. Nonzero V sky or beam
 inputs are not supported.
 
+## 0f/2f/4f focal-plane response (Patanchon form)
+
+`mueller=M` describes a fixed HWP-frame matrix rotated by η, `R(-η) M R(η)`.
+In that model every Mueller entry has a single HWP harmonic. A realistic HWP
+response, such as Table 1 of Patanchon et al. (arXiv:2308.00967), gives each
+focal-plane entry its own 0f, 2f and 4f terms instead:
+
+```
+M_ij(η) = M0f_ij + A2_ij cos(2η + φ2_ij) + A4_ij cos(4η + φ4_ij).
+```
+
+Pass the tables in the same form as the paper:
+
+```julia
+beam = prepare_hwp_blm(cp, blm_teb;
+    mueller_0f=M0f,                            # 4×4 IQUV, signed constant
+    mueller_2f=(amplitude=A2, phase=phi2),     # 4×4 each, phases in radians
+    mueller_4f=(amplitude=A4, phase=phi4))
+```
+
+- Rows are outputs and columns inputs, as for `mueller`. The V row and column
+  do not contribute (V=0).
+- `mueller_0f` is required. An omitted `mueller_2f` or `mueller_4f` is zero.
+  Combining these keywords with `mueller` is an error.
+- The response is in the focal-plane frame and already contains the HWP
+  rotation; no further rotation is applied. η is the mechanical HWP angle
+  relative to the focal plane (the paper's `ρ-ψ`), in the frame of the beam
+  coefficients.
+- Internally the response is the sum of five static Mueller elements,
+  `M(η) = M0f + Mc2 cos2η + Ms2 sin2η + Mc4 cos4η + Ms4 sin4η`, with
+  `Mcn = An .* cos.(φn)` and `Msn = -An .* sin.(φn)` (note the minus sign).
+  Each is mapped to the complex basis and prepared like a static Mueller
+  element, so each fills its own Fourier beam.
+- The ideal HWP is `M0f = diag(1,0,0,-1)` and a 4f table with amplitude one
+  for QQ, QU, UQ and UU and phases `0, -π/2, -π/2, π`.
+
+The paper's table is computed for one detector position (incidence angle and
+azimuth around the HWP axis). Other detector positions need their own tables;
+the azimuth transformation is not applied by Scanvolver. A table yields only
+0f, 2f and 4f modulation, so the five existing Fourier modes are sufficient.
+
 `HWP_rpm` is required by the configuration even when measured `hwp_angle`
 samples are supplied; it is not used to replace those samples. Set it to zero
 when only explicit phases are relevant. Alternatively supply absolute times:
@@ -69,16 +110,21 @@ fundamental spatial Mueller modes, as used in the project's LBS/SBM
 derivation. HWP time harmonics alone do not justify a spatial beam-index
 shift for arbitrary spatial Mueller fields.
 
-With normalized complex Stokes coefficients and `C=T*M*T†`, an element
-`C[X,Y]` carries harmonic `t=sigma[X]-sigma[Y]`, with `sigma=(0,2,-2,0)`.
-The conjugated effective coefficient at Wigner order `n` uses physical beam
-order `n-t`. The implementation handles the normalization between the
-normalized basis and the existing unnormalized spin blocks explicitly.
+With normalized complex Stokes coefficients, the response is written as
+`C(η) = Σ_j Γ_j f_j(η)` with `f = (1, cos2η, sin2η, cos4η, sin4η)`. An
+element `Γ_j[X,Y]` moves the beam order by `t=sigma[X]-sigma[Y]`, with
+`sigma=(0,2,-2,0)`, whatever its HWP harmonic: the conjugated effective
+coefficient at Wigner order `n` uses physical beam order `n-t`. The
+implementation handles the normalization between the normalized basis and
+the existing unnormalized spin blocks explicitly.
 
-Signed harmonics are combined analytically into the five real components
-`1, cos(2η), sin(2η), cos(4η), sin(4η)`. Each component is a real Stokes beam,
-so it satisfies the existing negative-mode reality relation. Only exactly
-zero components are omitted; small physical 2f terms are never thresholded.
+For a rotated fixed matrix, `C=T*M*T†` and the entry `C[X,Y]` has HWP harmonic
+`t` itself; its signed harmonics are combined analytically into the five
+components. For a 0f/2f/4f table, `Γ_j = T*M_j*T†` for the five static
+elements `M_j`, so an entry can carry every harmonic while its spatial shift
+stays `t`. Each component is a real Stokes beam, so it satisfies the
+existing negative-mode reality relation. Only exactly zero components are
+omitted; small physical 2f terms are never thresholded.
 
 `bnmax` remains the physical input cutoff. Effective beams and Wigner tables
 extend through `min(bnmax+4,lmax)`, and the retained sky-ring order extends
@@ -99,11 +145,20 @@ sizing uses the remaining device memory after their allocation. The GEMM
 moment memory estimator includes the additional modulation array when used.
 
 Both `convolve_to_hdf5` and `convolve_detector_groups_to_hdf5` accept
-`PreparedHWPBlm`. HDF5 files record the matrix, Fourier modes, effective cutoff,
-angle frame and demodulation convention. The existing map dataset axes are
-unchanged. HDF5.jl reverses dataset dimensions on disk; the Mueller dataset is
-`(output,input)` when read in Julia and `(input,output)` in Python. The file
-records both axis orders explicitly.
+`PreparedHWPBlm`. HDF5 files record the response, Fourier modes, effective
+cutoff, angle frame and demodulation convention. The attribute `hwp_response`
+is `rotating` or `fourier`:
+
+- `rotating`: the matrix in `hwp_mueller_iquv`.
+- `fourier`: the five tables in `hwp_mueller_0f_iquv`,
+  `hwp_mueller_2f_amplitude_iquv`, `hwp_mueller_2f_phase_iquv`,
+  `hwp_mueller_4f_amplitude_iquv` and `hwp_mueller_4f_phase_iquv`, with the
+  formula in `hwp_mueller_formula`.
+
+The existing map dataset axes are unchanged. HDF5.jl reverses dataset
+dimensions on disk; every Mueller dataset is `(output,input)` when read in
+Julia and `(input,output)` in Python. The file records both axis orders
+explicitly.
 
 ## Optional low-ell intensity response
 
@@ -129,8 +184,9 @@ Ludwig-3 frame. Multiplying a spin-2 beam by the Mueller spatial mode
 produces a scalar effective beam with ell=0,1. No spin-2 coefficient below
 ell=2 is introduced, and the original spin-2 guards remain in place.
 
-For output scalar multipole `ell`, Wigner order `n`, HWP harmonic `t=+/-2`,
-and polarized input beam order `k=n-t`, the scalar projection weight is
+For output scalar multipole `ell`, Wigner order `n`, beam-order shift
+`t=+/-2`, and polarized input beam order `k=n-t`, the scalar projection
+weight is
 
 ```math
 W_{\ell n t,\ell_1} = \sum_{\ell_2}
@@ -151,14 +207,18 @@ The triangle rule leaves one `ell2` for ell=0, and at most three for ell=1.
 once per beam-preparation call and reused across detector beams, in O(lmax)
 work per output coefficient. Summation uses Float64 before casting to the
 requested storage precision. No additional time-domain or GPU operation
-is needed; the result uses the existing cos2/sin2 Fourier beams. HDF5 files
-record the choice in the `hwp_lowell` attribute, and beam batches retain it.
+is needed. For a rotated fixed matrix the result uses the existing cos2/sin2
+Fourier beams. For a 0f/2f/4f table the projection depends only on `t`, so
+it is computed once and added to every Fourier beam with that channel's
+`M_QI/M_UI` entries, including their 0f and 4f terms. HDF5 files record the
+choice in the `hwp_lowell` attribute, and beam batches retain it.
 
-Only the **I-input ell=0,1 2f terms** are extended. Polarized sky has no
-ell<2 coefficients; all other terms, including ell>=2 and shifts with
-`abs(n)>ell`, retain the previous treatment. With no `M_QI/M_UI` coupling
-the prepared coefficients are unchanged. With no intensity sky monopole or
-dipole the additional coefficients do not contribute to the signal.
+Only the **I-input ell=0,1 terms of the `M_QI/M_UI` entries** are extended.
+Polarized sky has no ell<2 coefficients; all other terms, including ell>=2
+and shifts with `abs(n)>ell`, retain the previous treatment. With no
+`M_QI/M_UI` coupling the prepared coefficients are unchanged. With no
+intensity sky monopole or dipole the additional coefficients do not
+contribute to the signal.
 
 Nominal I/4f mapmaking can suppress 2f when the HWP-angle coverage is good.
 The residual depends on the scan, input sky, and Mueller matrix; neither
@@ -176,9 +236,21 @@ Checks cover phase transport across chunks and pixel sorting, harmonic
 selection without thresholding, beam reality, nominal IQU recovery, detector
 offsets, CPU/direct-GPU/GEMM moment agreement, and continuous subpixel
 convolution against independent finite Wigner sums for identity, ideal and
-general Mueller matrices. GPU checks use explicit skipped tests when CUDA is
-unavailable. Optional LBS comparison fixtures are written outside the package
-when `SCANVOLVER_HWP_FIXTURES` is set.
+general Mueller matrices and a 0f/2f/4f table. GPU checks use explicit skipped
+tests when CUDA is unavailable. Optional LBS comparison fixtures are written
+outside the package when `SCANVOLVER_HWP_FIXTURES` is set (rotating matrices
+only).
+
+The 0f/2f/4f tables are checked on the CPU against three oracles:
+
+- a rotated fixed matrix tabulated by an independent Fourier analysis, which
+  must reproduce the rotating model;
+- linearity: the sum of the five static elements, each prepared by the
+  rotating model at η=0 and weighted by `f_j(η)`;
+- the explicit shifted-beam formula with `T*M(η)*T†` evaluated directly.
+
+The low-ell option is checked against the independent real-space integral
+with the time-dependent intensity column `M(η)[:,I]`.
 
 The HWP-free regression suite remains required. Production-size throughput,
 κ/Chebyshev convergence for a particular experiment, and V coupling need

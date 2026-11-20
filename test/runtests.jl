@@ -4002,6 +4002,50 @@ function hwp_test_scan(cp)
     return (; phi, theta, psi, eta, pixels, rings)
 end
 
+# A general 0f/2f/4f focal-plane response in the table format of Patanchon et al.
+function hwp_test_fourier_table(seed)
+    wave(a, b) = [sin(seed + a*i + b*j) for i in 1:4, j in 1:4]
+    m0f = [0.96 0 0 0; 0 0 0 0; 0 0 0 0; 0 0 0 -0.96] .+ 0.03 .* wave(0.7, 0.4)
+    m2f = (amplitude=0.02 .* (1.5 .+ wave(0.3, 1.1)), phase=2.5 .* wave(1.3, -0.6))
+    m4f = (amplitude=[0 0 0 0; 0 .95 .95 0; 0 .95 .95 0; 0 0 0 0] .+ 0.01 .* (1.5 .+ wave(0.9, 0.2)),
+           phase=[0 0 0 0; 0 0 -pi/2 0; 0 -pi/2 pi 0; 0 0 0 0] .+ 0.3 .* wave(-0.5, 0.8))
+    return (mueller_0f=m0f, mueller_2f=m2f, mueller_4f=m4f)
+end
+
+# Direct elementwise evaluation of the table at one HWP angle.
+hwp_test_fourier_response(table, eta) = table.mueller_0f .+
+    table.mueller_2f.amplitude .* cos.(2eta .+ table.mueller_2f.phase) .+
+    table.mueller_4f.amplitude .* cos.(4eta .+ table.mueller_4f.phase)
+
+function hwp_test_stokes_rotation(eta)
+    c, s = cos(2eta), sin(2eta)
+    return [1 0 0 0; 0 c s 0; 0 -s c 0; 0 0 0 1]
+end
+
+# Independent 16-angle Fourier analysis of R(-eta) M R(eta), as a table.
+function hwp_test_rotating_table(M)
+    angles = 2pi .* (0:15) ./ 16
+    samples = [hwp_test_stokes_rotation(-eta) * M * hwp_test_stokes_rotation(eta) for eta in angles]
+    coefficient(n) = sum(samples[k] .* cis(-n * angles[k]) for k in eachindex(angles)) ./ 16
+    harmonic(n) = (c = coefficient(n); (amplitude=2 .* abs.(c), phase=angle.(c)))
+    return (mueller_0f=real.(coefficient(0)), mueller_2f=harmonic(2), mueller_4f=harmonic(4))
+end
+
+# Conjugated effective beam sum_j f_j(eta) b_j at multipole l.
+function hwp_test_effective(prepared, eta, l)
+    nmax = min(prepared.effective_bnmax, l)
+    total = ntuple(_ -> zeros(ComplexF64, 2nmax + 1, prepared.numofbeam), 3)
+    for (mode, component) in zip(prepared.modes, prepared.components)
+        f = Scanvolver._hwp_modulation(mode, eta)
+        for (sum_block, block) in zip(total, blm_slice(component, l))
+            sum_block .+= f .* block
+        end
+    end
+    return total
+end
+
+hwp_test_error(a, b) = maximum(maximum(abs, x .- y) for (x, y) in zip(a, b))
+
 @testset "HWP phase transport and Fourier beams" begin
     cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,
                            HWP=true,HWP_rpm=46.)
@@ -4112,11 +4156,12 @@ end
         rawbeams=[hwp_test_coefficients(6,0.2),hwp_test_coefficients(6,0.7)]
         sky=prepare_alm(cp,rawsky)
         buffer=build_ring_scan_buffer(cp,scan.phi,scan.theta,scan.psi;hwp_angle=scan.eta)
-        cases=[("identity",Matrix{Float64}(I,4,4)),("ideal",_HWP_IDEAL_TEST),
-               ("random",_HWP_IDEAL_TEST .+ [0.03sin(0.7i+0.4j) for i in 1:4,j in 1:4])]
+        cases=[("identity",(mueller=Matrix{Float64}(I,4,4),)),("ideal",(mueller=_HWP_IDEAL_TEST,)),
+               ("random",(mueller=_HWP_IDEAL_TEST .+ [0.03sin(0.7i+0.4j) for i in 1:4,j in 1:4],)),
+               ("fourier",hwp_test_fourier_table(0.4))]
         mktempdir() do dir
-            for (label,M) in cases
-                beams=prepare_hwp_blm(cp,rawbeams;mueller=M)
+            for (label,response) in cases
+                beams=prepare_hwp_blm(cp,rawbeams;response...)
                 tod=hwp_test_direct_tod(cp,rawsky,beams,scan.phi,scan.theta,scan.psi,scan.eta)
                 @test maximum(abs,imag.(tod)) < 1e-12maximum(abs,tod)
                 expected=fill(NaN,cp.resol.numOfPixels,3,2,1)
@@ -4135,7 +4180,14 @@ end
                     actual=read(f["map"])
                     @test actual[unique(scan.pixels),:,:,:] ≈ expected[unique(scan.pixels),:,:,:] atol=3e-11 rtol=3e-10
                     @test read(attributes(f)["hwp_demodulation"]) == "2psi+4eta"
-                    @test read(f["hwp_mueller_iquv"]) == M
+                    if haskey(response,:mueller)
+                        @test read(attributes(f)["hwp_response"]) == "rotating"
+                        @test read(f["hwp_mueller_iquv"]) == response.mueller
+                    else
+                        @test read(attributes(f)["hwp_response"]) == "fourier"
+                        @test read(f["hwp_mueller_0f_iquv"]) == response.mueller_0f
+                        @test read(f["hwp_mueller_4f_phase_iquv"]) == response.mueller_4f.phase
+                    end
                 end
                 # Automatic batching, memory and tiles must preserve all HWP
                 # modes, including their expanded Wigner order, on both GPUs.
@@ -4154,9 +4206,9 @@ end
                     @test all(==(0),read(f["rings/tile_retries"]))
                     @test all(==(4),read(f["rings/tile_count"])[scan.rings])
                 end
-                if label == "random"
+                if label in ("random","fourier")
                     offsets=[0.23,0.8]; weights=[1.0,2.0]
-                    group_target=joinpath(dir,"grouped.h5")
+                    group_target=joinpath(dir,label*"_grouped.h5")
                     convolve_detector_groups_to_hdf5(cp,buffer,sky,beams;
                         output_path=group_target,rings=scan.rings,beta_order=12,l_tile=2,
                         detector_labels=["a","b"],detector_offsets=offsets,
@@ -4173,7 +4225,7 @@ end
                         end
                         @test grouped[pixel,:,1,1] ≈ normal\rhs atol=3e-11 rtol=3e-10
                     end
-                    automatic_group_target=joinpath(dir,"grouped_automatic.h5")
+                    automatic_group_target=joinpath(dir,label*"_grouped_automatic.h5")
                     convolve_detector_groups_to_hdf5(cp,buffer,sky,beams;
                         output_path=automatic_group_target,rings=scan.rings,devices=:auto,
                         beta_order=12,max_l_tile=2,detector_labels=["a","b"],
@@ -4184,10 +4236,10 @@ end
                         @test read(attributes(f)["group_batch_size"]) == 1
                         @test read(f["rings/beam_applications"]) == read(f["rings/tile_count"]) .* length(beams.modes)
                     end
-                    single_target=joinpath(dir,"float32_direct.h5")
+                    single_target=joinpath(dir,label*"_float32_direct.h5")
                     devices=length(CUDA.devices())>=2 && Threads.nthreads()>=2 ? [0,1] : [0]
                     convolve_to_hdf5(cp,buffer,prepare_alm(cp,rawsky;precision=Float32),
-                        prepare_hwp_blm(cp,rawbeams;mueller=M,precision=Float32);
+                        prepare_hwp_blm(cp,rawbeams;response...,precision=Float32);
                         output_path=single_target,rings=scan.rings,beam_batch_size=2,
                         devices,beta_order=12,l_tile=2,rcond=1e-10,moment_method=:direct)
                     single=h5open(f->read(f["map"]),single_target,"r")
@@ -4195,11 +4247,11 @@ end
                 end
                 # Optional out-of-repository fixture for an external LBS oracle.
                 fixture_dir=get(ENV,"SCANVOLVER_HWP_FIXTURES","")
-                if !isempty(fixture_dir)
+                if !isempty(fixture_dir) && haskey(response,:mueller)
                     mkpath(fixture_dir)
                     h5open(joinpath(fixture_dir,label*"_fixture.h5"),"w") do f
                         f["sky"]=rawsky; f["beam1"]=rawbeams[1]; f["beam2"]=rawbeams[2]
-                        f["mueller"]=M; f["phi"]=scan.phi; f["theta"]=scan.theta
+                        f["mueller"]=response.mueller; f["phi"]=scan.phi; f["theta"]=scan.theta
                         f["psi"]=scan.psi; f["eta"]=scan.eta; f["pixels"]=scan.pixels
                         f["tod"]=tod; f["expected_maps"]=expected
                         f["actual_maps"]=h5open(x->read(x["map"]),target,"r")
@@ -4251,7 +4303,15 @@ function lowell_test_moments(raw, lmax, bnmax)
     return mean, moment
 end
 
-function lowell_test_reference(raw, cp, mono, dipole, matrix, phi, theta, psi, eta)
+function lowell_test_reference(raw, cp, mono, dipole, matrix::AbstractMatrix, phi, theta, psi, eta)
+    # Intensity column of R(-eta) M R(eta) for a rotating HWP-frame matrix.
+    column(angle) = (c = cos(2angle); s = sin(2angle);
+        (matrix[1,1], c*matrix[2,1]-s*matrix[3,1], s*matrix[2,1]+c*matrix[3,1]))
+    return lowell_test_reference(raw, cp, mono, dipole, column, phi, theta, psi, eta)
+end
+
+# `column(eta)` is the focal-plane intensity column (M_II, M_QI, M_UI) at eta.
+function lowell_test_reference(raw, cp, mono, dipole, column::Function, phi, theta, psi, eta)
     mean, moment = lowell_test_moments(raw, cp.lmax, cp.bnmax)
     output = zeros(length(phi))
     vx, vy, vz = dipole
@@ -4262,10 +4322,9 @@ function lowell_test_reference(raw, cp, mono, dipole, matrix, phi, theta, psi, e
         local_d = [cos(psi[i])*dx+sin(psi[i])*dy,
                    -sin(psi[i])*dx+cos(psi[i])*dy, dz]
         integrals = mono*mean + moment*local_d
-        c, s = cos(2eta[i]), sin(2eta[i])
-        output[i] = integrals[1]*matrix[1,1] +
-            integrals[2]*(c*matrix[2,1]-s*matrix[3,1]) +
-            integrals[3]*(s*matrix[2,1]+c*matrix[3,1])
+        response = column(eta[i])
+        output[i] = integrals[1]*response[1] + integrals[2]*response[2] +
+            integrals[3]*response[3]
     end
     return output
 end
@@ -4361,4 +4420,197 @@ end
     @test only(beam_batches(full,1)).blm.lowell_hwp === :full_sum
     @test_throws ArgumentError prepare_hwp_blm(cp,raw;lowell_hwp=:invalid)
     @test Scanvolver._hwp_lowell_weights(0,0,2,4)[3] ≈ sqrt(5)/3 atol=1e-15
+end
+
+@testset "HWP Fourier response inputs, modes and provenance" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,numofbeam=2,HWP=true,HWP_rpm=0.)
+    raw = [hwp_test_coefficients(6,0.2), hwp_test_coefficients(6,0.7)]
+    table = hwp_test_fourier_table(0.4)
+    prepared = prepare_hwp_blm(cp,raw;table...)
+    @test prepared.modes == collect(Scanvolver._HWP_MODES)
+    @test prepared.effective_bnmax == 6
+    @test prepared.mueller === nothing
+    @test prepared.mueller_fourier.mueller_0f == table.mueller_0f
+    @test prepared.mueller_fourier.mueller_2f == table.mueller_2f
+    @test prepared.mueller_fourier.mueller_4f == table.mueller_4f
+    rotating = prepare_hwp_blm(cp,raw)
+    @test rotating.mueller == _HWP_IDEAL_TEST && rotating.mueller_fourier === nothing
+
+    zero_table = (amplitude=zeros(4,4), phase=zeros(4,4))
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller=_HWP_IDEAL_TEST,mueller_0f=table.mueller_0f)
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_2f=table.mueller_2f)
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f[1:3,1:3])
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=fill(NaN,4,4))
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=complex.(table.mueller_0f,1.0))
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f,mueller_2f=table.mueller_2f.amplitude)
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f,
+        mueller_2f=(amplitude=table.mueller_2f.amplitude,))
+    @test_throws ArgumentError prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f,
+        mueller_4f=(amplitude=table.mueller_4f.amplitude,phase=fill(Inf,4,4)))
+    # An omitted harmonic is zero.
+    @test lowell_test_same(prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f,mueller_4f=table.mueller_4f),
+        prepare_hwp_blm(cp,raw;mueller_0f=table.mueller_0f,mueller_2f=zero_table,mueller_4f=table.mueller_4f))
+
+    # The ideal HWP in the paper's format: 0f, plus 4f with phases 0, -pi/2, pi.
+    ideal = (mueller_0f=[1. 0 0 0; 0 0 0 0; 0 0 0 0; 0 0 0 -1],
+             mueller_4f=(amplitude=[0 0 0 0; 0 1. 1 0; 0 1 1 0; 0 0 0 0],
+                         phase=[0 0 0 0; 0 0 -pi/2 0; 0 -pi/2 pi 0; 0 0 0 0]))
+    from_table = prepare_hwp_blm(cp,raw;ideal...)
+    @test from_table.modes == [:constant,:cos4,:sin4]
+    @test maximum(hwp_test_error(hwp_test_effective(from_table,eta,l),hwp_test_effective(rotating,eta,l))
+                  for eta in (0.,0.37,1.9,-2.6) for l in 0:6) < 1e-15
+    tiny_amplitude = zeros(4,4); tiny_amplitude[1,2] = 1e-25
+    tiny = prepare_hwp_blm(cp,raw;ideal...,mueller_2f=(amplitude=tiny_amplitude,phase=zeros(4,4)))
+    @test tiny.modes == [:constant,:cos2,:cos4,:sin4]
+
+    # The V row and column do not contribute.
+    without_v(x) = (y = copy(x); y[4,:] .= 0; y[:,4] .= 0; y)
+    stripped = (mueller_0f=without_v(table.mueller_0f),
+                mueller_2f=map(without_v,table.mueller_2f), mueller_4f=map(without_v,table.mueller_4f))
+    @test lowell_test_same(prepared,prepare_hwp_blm(cp,raw;stripped...))
+
+    # Every component is a real Stokes beam.
+    @test all(begin
+            blocks = blm_slice(b,l); nmax = min(b.bnmax,l)
+            all(maximum(abs, blocks[s][-n+nmax+1,:] .- (-1.0)^n .* conj.(blocks[s == 1 ? 1 : 5-s][n+nmax+1,:])) < 1e-15
+                for n in -nmax:nmax for s in 1:3)
+        end for b in prepared.components for l in 0:6)
+
+    single = prepare_hwp_blm(cp,raw;table...,precision=Float32)
+    @test single.modes == prepared.modes
+    @test maximum(hwp_test_error(hwp_test_effective(single,eta,l),hwp_test_effective(prepared,eta,l))
+                  for eta in (0.,1.1) for l in 0:6) < 1e-6
+
+    batches = beam_batches(prepared,1)
+    @test length(batches) == 2
+    @test batches[2].blm.mueller === nothing
+    @test batches[2].blm.mueller_fourier == prepared.mueller_fourier
+    @test batches[2].blm.modes == prepared.modes
+
+    mktempdir() do dir
+        path = joinpath(dir,"fourier.h5")
+        h5open(f -> Scanvolver.write_hwp_provenance(f,prepared),path,"w")
+        h5open(path,"r") do f
+            @test read(attributes(f)["hwp_response"]) == "fourier"
+            @test read(f["hwp_mueller_0f_iquv"]) == table.mueller_0f
+            @test read(f["hwp_mueller_2f_amplitude_iquv"]) == table.mueller_2f.amplitude
+            @test read(f["hwp_mueller_2f_phase_iquv"]) == table.mueller_2f.phase
+            @test read(f["hwp_mueller_4f_amplitude_iquv"]) == table.mueller_4f.amplitude
+            @test read(f["hwp_mueller_4f_phase_iquv"]) == table.mueller_4f.phase
+            @test read(f["hwp_fourier_modes"]) == string.(prepared.modes)
+            @test !haskey(f,"hwp_mueller_iquv")
+        end
+        path = joinpath(dir,"rotating.h5")
+        h5open(f -> Scanvolver.write_hwp_provenance(f,rotating),path,"w")
+        h5open(path,"r") do f
+            @test read(attributes(f)["hwp_response"]) == "rotating"
+            @test read(f["hwp_mueller_iquv"]) == _HWP_IDEAL_TEST
+            @test !haskey(f,"hwp_mueller_0f_iquv")
+        end
+    end
+end
+
+@testset "HWP Fourier response against rotating, static and explicit oracles" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,numofbeam=2,HWP=true,HWP_rpm=0.)
+    raw = [hwp_test_coefficients(6,0.2), hwp_test_coefficients(6,0.7)]
+    etas = (0.0,0.41,1.3,2.9,-0.77,4.4)
+
+    # A rotated fixed matrix, tabulated by an independent Fourier analysis,
+    # reproduces the rotating model.
+    general = [0.9+0.1i-0.07j+0.05sin(3i+j) for i in 1:4, j in 1:4]
+    for M in (_HWP_IDEAL_TEST, _HWP_IDEAL_TEST .+ [0.03sin(0.7i+0.4j) for i in 1:4,j in 1:4], general)
+        rotating = prepare_hwp_blm(cp,raw;mueller=M)
+        tabulated = prepare_hwp_blm(cp,raw;hwp_test_rotating_table(M)...)
+        @test maximum(hwp_test_error(hwp_test_effective(tabulated,eta,l),hwp_test_effective(rotating,eta,l))
+                      for eta in etas for l in 0:6) < 1e-14
+    end
+    rawsky = hwp_test_coefficients(6,0.9)
+    scan = hwp_test_scan(cp)
+    direct(prepared) = hwp_test_direct_tod(cp,rawsky,prepared,scan.phi,scan.theta,scan.psi,scan.eta)
+    @test maximum(abs, direct(prepare_hwp_blm(cp,raw;hwp_test_rotating_table(general)...)) .-
+                       direct(prepare_hwp_blm(cp,raw;mueller=general))) < 1e-13
+
+    # Linearity: the response is five static Mueller elements modulated by
+    # f(eta). Each static element is the rotating model evaluated at eta=0.
+    table = hwp_test_fourier_table(0.4)
+    prepared = prepare_hwp_blm(cp,raw;table...)
+    A2, P2 = table.mueller_2f
+    A4, P4 = table.mueller_4f
+    channels = (table.mueller_0f, A2 .* cos.(P2), -A2 .* sin.(P2), A4 .* cos.(P4), -A4 .* sin.(P4))
+    static = [prepare_hwp_blm(cp,raw;mueller=M) for M in channels]
+    worst = 0.0
+    for eta in etas, l in 0:6
+        f = (1.0, cos(2eta), sin(2eta), cos(4eta), sin(4eta))
+        expected = ntuple(_ -> zeros(ComplexF64,2min(prepared.effective_bnmax,l)+1,2),3)
+        for (weight, element) in zip(f, static), (sum_block, block) in zip(expected, hwp_test_effective(element,0.0,l))
+            sum_block .+= weight .* block
+        end
+        worst = max(worst, hwp_test_error(hwp_test_effective(prepared,eta,l),expected))
+    end
+    @test worst < 1e-14
+
+    # Explicit shifted-beam formula with C(eta)=T*M(eta)*T' from the table
+    # evaluated directly at eta.
+    T3 = [1 0 0; 0 1/sqrt(2) im/sqrt(2); 0 1/sqrt(2) -im/sqrt(2)]
+    sigma, scale = (0,2,-2), (1.0,1/sqrt(2),1/sqrt(2))
+    physical = prepare_blm(ConvolutionParams(cp;HWP=false),raw)
+    worst = 0.0
+    for eta in etas, l in 2:6
+        C = T3 * hwp_test_fourier_response(table,eta)[1:3,1:3] * T3'
+        source = blm_slice(physical,l)
+        actual = hwp_test_effective(prepared,eta,l)
+        nmax, pmax = min(prepared.effective_bnmax,l), min(cp.bnmax,l)
+        for Y in 1:3, n in -nmax:nmax
+            expected = zeros(ComplexF64,2)
+            for X in 1:3
+                k = n - (sigma[X] - sigma[Y])
+                abs(k) <= pmax && (expected .+= scale[X]/scale[Y]*C[X,Y] .* source[X][k+pmax+1,:])
+            end
+            worst = max(worst, maximum(abs, actual[Y][n+nmax+1,:] .- expected))
+        end
+    end
+    @test worst < 1e-14
+end
+
+@testset "Low-ell HWP Fourier response against real-space TOD" begin
+    cp = ConvolutionParams(nside_output=4,lmax=6,lstop=6,bnmax=3,κ=12,numofbeam=2,HWP=true,HWP_rpm=0.)
+    mono, dipole = .7, [.31,-.22,.17]
+    sky = zeros(ComplexF64,3,28)
+    sky[1,1] = mono*sqrt(4pi)
+    sky[1,2] = dipole[3]*sqrt(4pi/3)
+    sky[1,8] = -(dipole[1]-im*dipole[2])*sqrt(2pi/3)
+    beams = [lowell_test_beam(6,.2), lowell_test_beam(6,.7)]
+    beams[2][1,:] .= 0 # P-only diagnostic in the same multi-beam call.
+    table = hwp_test_fourier_table(1.1)
+    @test all(!iszero, table.mueller_0f[2:3,1]) && all(!iszero, table.mueller_2f.amplitude[2:3,1]) &&
+          all(!iszero, table.mueller_4f.amplitude[2:3,1])
+    prepared = prepare_hwp_blm(cp,beams;table...,lowell_hwp=:full_sum)
+    phi, theta, psi, eta = Float64[], Float64[], Float64[], Float64[]
+    for ring in (4,7,11), position in (1,3), hit in 1:24
+        geometry = ring_geometry(cp,ring)
+        push!(phi,geometry.phi_pixels[position]); push!(theta,geometry.theta)
+        push!(psi,.43hit+.17position); push!(eta,.71hit+.23position+.13ring)
+    end
+    actual = hwp_test_direct_tod(cp,sky,prepared,phi,theta,psi,eta)
+    column(angle) = hwp_test_fourier_response(table,angle)[1:3,1]
+    reference = hcat([lowell_test_reference(beam,cp,mono,dipole,column,phi,theta,psi,eta) for beam in beams]...)
+    @test maximum(abs,imag.(actual)) < 1e-14
+    @test real.(actual) ≈ reference atol=2e-12 rtol=2e-11
+    @test maximum(abs,real.(actual[:,2])) > 1e-5
+
+    shifted = prepare_hwp_blm(cp,beams;table...)
+    @test lowell_test_same(shifted,prepared;first_l=2)
+    @test !lowell_test_same(shifted,prepared)
+    # Every channel, not just 2f, gains its own low-ell term.
+    @test shifted.modes == prepared.modes
+    @test all(blm_slice(a,l)[1] != blm_slice(b,l)[1]
+              for (a,b) in zip(shifted.components,prepared.components) for l in 0:1)
+
+    # Without I->Q,U coupling in any channel the option changes nothing.
+    without_qu(x) = (y = copy(x); y[2:3,1] .= 0; y)
+    uncoupled = (mueller_0f=without_qu(table.mueller_0f),
+                 mueller_2f=(amplitude=without_qu(table.mueller_2f.amplitude),phase=table.mueller_2f.phase),
+                 mueller_4f=(amplitude=without_qu(table.mueller_4f.amplitude),phase=table.mueller_4f.phase))
+    @test lowell_test_same(prepare_hwp_blm(cp,beams;uncoupled...),
+                           prepare_hwp_blm(cp,beams;uncoupled...,lowell_hwp=:full_sum))
 end
