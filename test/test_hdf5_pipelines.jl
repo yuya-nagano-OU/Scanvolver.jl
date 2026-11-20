@@ -251,11 +251,53 @@ end
                 estimate = sky_ring_fft_workspace_bytes(T, 4, 300, pixel_count)
                 @test estimate in (0, sizeof(values))
                 @test taken <= estimate + Scanvolver._CUFFT_PLAN_OVERHEAD_BYTES
-                finalize(fft_plan.p)
+                Scanvolver._release_fft_plans!((fft_plan,))
                 empty!(CUDA.CUFFT.idle_handles)
+                @test isempty(CUDA.CUFFT.idle_handles.idle_handles)
                 CUDA.unsafe_free!(values)
             end
             @test sky_ring_fft_workspace_bytes(Float32, 4, 300, 2044) == 4 * 300 * 2044 * 8
+        end
+
+        @testset "cuFFT release with a retirement backlog" begin
+            core = Scanvolver._CUDA_HANDLE_MODULE
+            if isdefined(core, :drain_retired)
+                values = CUDA.zeros(ComplexF32, 1, 1, 16)
+                fft_plan = CUDA.CUFFT.plan_ifft!(values, (3,))
+                fft_plan * values
+                CUDA.synchronize()
+                native_handle = fft_plan.p.handle
+                handle_cache = CUDA.CUFFT.idle_handles
+                is_active() = lock(handle_cache.lock) do
+                    any(entry -> first(entry)[1] == fft_plan.p.ctx &&
+                                 last(entry) == native_handle, handle_cache.active_handles)
+                end
+                try
+                    lock(core.drain_lock) do
+                        # Make the bounded drain leave an older action in the backlog.
+                        # Holding its lock excludes the background drainer.
+                        while core.drain_retired() > 0
+                        end
+                        core.retire!(core.ReleaseAction(identity, nothing, nothing, false))
+                        core.retire!(core.ReleaseAction(identity, nothing, nothing, false))
+                        @test core.drain_retired(1) == 1
+                        @test is_active()
+                        Scanvolver._release_fft_plans!((fft_plan,))
+                        empty!(handle_cache)
+                        @test iszero(fft_plan.p.handle)
+                        @test !is_active()
+                    end
+                finally
+                    # Clean up even if this regression encounters the old behavior.
+                    finalize(fft_plan.p)
+                    while core.drain_retired() > 0
+                    end
+                    empty!(handle_cache)
+                    CUDA.unsafe_free!(values)
+                end
+            else
+                @test_skip isdefined(core, :drain_retired)
+            end
         end
 
         @testset "partial rings, writer errors and beta errors" begin

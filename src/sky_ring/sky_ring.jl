@@ -27,13 +27,36 @@ function _sky_ring_ifft!(sky_ring, cache::_SkyRingFFTPlanCache)
     return sky_ring
 end
 
-function _release_sky_ring_fft_plans!(cache::_SkyRingFFTPlanCache)
-    CUDA.synchronize()
-    for fft_plan in values(cache.plans)
+# The module that defines CUDA.jl's library handle caches (CUDACore).
+const _CUDA_HANDLE_MODULE = parentmodule(typeof(CUDA.CUFFT.idle_handles))
+
+# finalize deregisters the finalizer and releases the plan on CUDA.jl <=6.4.
+# On 6.5 it queues a release. The caller has synchronized the FFT before
+# either path and will purge the idle handle cache after this function returns.
+function _release_fft_plans!(fft_plans)
+    for fft_plan in fft_plans
         finalize(fft_plan.p)
     end
+    if isdefined(_CUDA_HANDLE_MODULE, :drain_retired)
+        # A drain can consume an older backlog without visiting the new queue.
+        # Take CUDA's drain lock so a different task cannot be halfway through
+        # the release when we check the plan. cuFFT clears the plan's own handle
+        # after returning it to the cache, where another plan may reuse it.
+        lock(_CUDA_HANDLE_MODULE.drain_lock) do
+            while any(plan -> !iszero(plan.p.handle), fft_plans)
+                _CUDA_HANDLE_MODULE.drain_retired() > 0 ||
+                    error("CUDA's retirement queue did not complete the cuFFT plan release")
+            end
+        end
+    end
+    return nothing
+end
+
+function _release_sky_ring_fft_plans!(cache::_SkyRingFFTPlanCache)
+    CUDA.synchronize()
+    _release_fft_plans!(values(cache.plans))
     empty!(cache.plans)
-    # Finalizing a plan returns its native handle to cuFFT.jl's global cache.
+    # Releasing a plan returns its native handle to cuFFT.jl's global cache.
     # The cache key contains the complete input shape, so polar rings would
     # otherwise retain a separate workspace for every pixel count.  cuFFT.jl
     # 6.3.1 does not register this cache with CUDA.reclaim(), hence the
@@ -249,13 +272,18 @@ function build_sky_ring_gpu(
         succeeded = true
         return sky_ring
     finally
-        if fft_plan !== nothing
-            CUDA.synchronize()
-            finalize(fft_plan.p)
-            # `finalize` only makes the native handle idle.  A standalone
-            # caller has no ring cache whose release would destroy it.
-            empty!(CUDA.CUFFT.idle_handles)
+        try
+            if fft_plan !== nothing
+                CUDA.synchronize()
+                _release_fft_plans!((fft_plan,))
+                # A standalone caller purges the returned handle here.
+                empty!(CUDA.CUFFT.idle_handles)
+            end
+        catch
+            succeeded = false
+            rethrow()
+        finally
+            succeeded || CUDA.unsafe_free!(sky_ring)
         end
-        succeeded || CUDA.unsafe_free!(sky_ring)
     end
 end

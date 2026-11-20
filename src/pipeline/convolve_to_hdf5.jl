@@ -220,11 +220,14 @@ function process_ring!(writer, layout, context, cp, buffer, batches, plan, ring;
             estimated_tile_bytes=Int64(tile_bytes), tile_retries=tile_retries,
         ), extra_record(layout, cp, T, length(active), batches)), progress_callback; started_ns)
     finally
-        CUDA.synchronize()
-        _release_sky_ring_fft_plans!(plan_cache)
-        foreach(CUDA.unsafe_free!, accumulators)
-        foreach(CUDA.unsafe_free!, moments)
-        active === nothing || CUDA.unsafe_free!(active.positions)
+        try
+            CUDA.synchronize()
+            _release_sky_ring_fft_plans!(plan_cache)
+        finally
+            foreach(CUDA.unsafe_free!, accumulators)
+            foreach(CUDA.unsafe_free!, moments)
+            active === nothing || CUDA.unsafe_free!(active.positions)
+        end
     end
     return nothing
 end
