@@ -57,7 +57,8 @@ Pass the tables in the same form as the paper:
 beam = prepare_hwp_blm(cp, blm_teb;
     mueller_0f=M0f,                            # 4×4 IQUV, signed constant
     mueller_2f=(amplitude=A2, phase=phi2),     # 4×4 each, phases in radians
-    mueller_4f=(amplitude=A4, phase=phi4))
+    mueller_4f=(amplitude=A4, phase=phi4),
+    lowell_hwp=:full_sum)                      # retain monopole and dipole leakage
 ```
 
 - Rows are outputs and columns inputs, as for `mueller`. The V row and column
@@ -163,11 +164,11 @@ explicitly.
 ## Optional low-ell intensity response
 
 The default `lowell_hwp=:shifted` keeps the original approximation. In that
-model, the I-input ell=0,1 2f terms proportional to `M_QI` and `M_UI` are
-absent: the same-ell polarized beam coefficients do not exist. This is a
-limitation of the shifted-beam model, not a statement that physical intensity
-monopoles and dipoles cannot generate a 2f signal. LBS uses the same shifted
-model and therefore cannot independently validate these terms.
+model, the I-input ell=0,1 leakage proportional to `M_QI` and `M_UI`
+is absent because the same-ell polarized beam coefficients do not exist.
+This affects 2f for the rotating-matrix model and every supplied harmonic
+for the Fourier tables. Use `lowell_hwp=:full_sum` for the Patanchon
+Table 1 dipole leakage, including its 4f term.
 
 To retain the beam multipole sum for just these terms, use:
 
@@ -255,3 +256,9 @@ with the time-dependent intensity column `M(η)[:,I]`.
 The HWP-free regression suite remains required. Production-size throughput,
 κ/Chebyshev convergence for a particular experiment, and V coupling need
 their own validation; low-l tests do not establish those results.
+
+The Table 1 regression uses the published 140 GHz, 10-degree coefficients,
+including their original phases. It compares the direct paper TOD at
+eta = rho - psi with the shifted-beam harmonic sum for a symmetric
+23.7-arcmin Gaussian window. A separate dipole check isolates the 4f
+I-to-Q/U leakage and verifies its recovery with `lowell_hwp=:full_sum`.

@@ -4614,3 +4614,5 @@ end
     @test lowell_test_same(prepare_hwp_blm(cp,beams;uncoupled...),
                            prepare_hwp_blm(cp,beams;uncoupled...,lowell_hwp=:full_sum))
 end
+
+include("test_hwp_patanchon.jl")
